@@ -20,6 +20,12 @@ data "juju_model" "model" {
 module "cos-lite" {
   source       = "git::https://github.com/canonical/observability-stack//terraform/cos-lite?ref=track/3.0"
   model        = { uuid = data.juju_model.model.uuid }
-  risk         = "stable"
+  risk         = var.risk
   internal_tls = true
+}
+
+# Risk of the upgrade target; override with TF_VAR_risk (e.g. beta)
+variable "risk" {
+  type    = string
+  default = "edge"
 }

@@ -3,6 +3,7 @@ set export  # Just variables are exported to the environment
 
 terraform := `which terraform || which tofu || echo ""` # require 'terraform' or 'opentofu'
 uv_flags := "--frozen --isolated"
+risk := env_var_or_default("TF_VAR_risk", "edge") # upgrade target's risk in integration tests; override with `just risk=beta integration ...`
 
 [private]
 default:
@@ -68,8 +69,8 @@ unit-test module:
   if [ -z "${terraform}" ]; then echo "ERROR: please install terraform or opentofu"; exit 1; fi
   $terraform -chdir={{module}} init -upgrade && $terraform -chdir={{module}} test
 
-# Run integration tests
+# Run integration tests; `just risk=beta integration ...` (or TF_VAR_risk=beta) picks the upgrade target's risk
 [group("Integration")]
 [working-directory("./tests/integration")]
 integration *args='':
-  uv run ${uv_flags} pytest -vv -ra --capture=no --exitfirst {{args}}
+  TF_VAR_risk={{risk}} uv run ${uv_flags} pytest -vv -ra --capture=no --exitfirst {{args}}

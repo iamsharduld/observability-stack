@@ -32,7 +32,7 @@ variable "s3_access_key" {
 module "cos" {
   source       = "git::https://github.com/canonical/observability-stack//terraform/cos?ref=track/3.0"
   model        = { uuid = data.juju_model.model.uuid }
-  risk         = "edge"
+  risk         = var.risk
   internal_tls = false
 
   s3_endpoint   = var.s3_endpoint
@@ -47,4 +47,10 @@ module "cos" {
   mimir_worker      = { backend_units = 1, read_units = 1, write_units = 1 }
   tempo_coordinator = { units = 1 }
   tempo_worker      = { compactor_units = 1, distributor_units = 1, ingester_units = 1, metrics_generator_units = 1, querier_units = 1, query_frontend_units = 1 }
+}
+
+# Risk of the upgrade target; override with TF_VAR_risk (e.g. beta)
+variable "risk" {
+  type    = string
+  default = "edge"
 }
