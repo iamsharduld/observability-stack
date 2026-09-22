@@ -1,4 +1,30 @@
 #!/bin/bash
-set -eu
+# Entry point for SolQA's test hook: their Deploy Product pipeline runs this
+# from the repo root once COS or COS Lite is deployed in the "cos" model.
+#
+# Runs every check, without stopping at the first failure so one run shows
+# every problem, then writes test_results.xml and metrics.json, which the
+# pipeline uploads as run artifacts. Exits non-zero if any check failed.
+set -u
 
-./tests/sqa/model-active
+# SolQA's spec (SQ088) expects the result files next to this executable
+cd "$(dirname "$0")" || exit 1
+
+MODEL="cos"
+CHECKS=(model-active)
+
+logs=$(mktemp -d)
+results="${logs}/results.tsv"
+failed=0
+
+for check in "${CHECKS[@]}"; do
+    echo "==> Running check: ${check}"
+    start=$(date +%s)
+    ./tests/sqa/"${check}" 2>&1 | tee "${logs}/${check}.log"
+    code=${PIPESTATUS[0]}
+    printf '%s\t%s\t%s\t%s\n' "${check}" "${code}" "$(($(date +%s) - start))" "${logs}/${check}.log" >> "${results}"
+    [ "${code}" -eq 0 ] || failed=1
+done
+
+./tests/sqa/report "${results}" "${MODEL}" || failed=1
+exit "${failed}"

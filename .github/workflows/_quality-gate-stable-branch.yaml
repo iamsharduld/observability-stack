@@ -1,0 +1,258 @@
+name: Test a branch's solutions on SolQA and release them to stable
+
+# Reusable workflow, called once per branch from quality-gates-stable.yaml:
+#
+# 1. Pin: record the exact /candidate revisions (and resource revisions) of
+#    every charm the branch's COS and COS Lite modules deploy. Stop early if
+#    /stable already holds exactly these.
+# 2. Test: deploy each product at /candidate on SolQA's lab through their
+#    remote executor, running our `sqa_tests` from this commit.
+# 3. Check: judge the run by its test_results.xml, not its colour (SolQA's
+#    test step ignores failures), and check it deployed the pinned revisions.
+# 4. Release: after approval through the `stable` environment, release
+#    exactly the pinned revisions to /stable. Releasing by revision, instead
+#    of promoting the channel, keeps anything that reached /candidate during
+#    the test out of /stable.
+#
+# A SolQA run without a test result failed in the lab or pipeline, before our
+# tests ran: start this workflow again rather than re-running the SolQA run.
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'The branch/track whose Terraform modules define the solutions (e.g. "track/3.0").'
+        required: true
+        type: string
+      cluster:
+        description: "The SolQA cluster to deploy on."
+        required: true
+        type: string
+      dry_run:
+        description: "Only print the release commands instead of releasing."
+        required: true
+        type: boolean
+    secrets:
+      TERRAGRUNT_DEPLOYMENT_PIPELINES_TOKEN:
+        required: true
+      CHARMHUB_TOKEN:
+        required: true
+
+env:
+  SOLQA_REPO: canonical/terragrunt-deployment-pipelines
+
+defaults:
+  run:
+    # An explicit shell adds pipefail, so `... | tee` still fails the step
+    shell: bash
+
+jobs:
+  pin:
+    name: Pin candidate revisions
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The recipes read the branch's Terraform modules through git
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo snap install just --classic
+
+      - name: Pin each product
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          mkdir pins
+          for product in cos cos-lite; do
+            just solution pin "$product" "origin/${BRANCH}" candidate > "pins/${product}.json"
+          done
+          # COS and COS Lite share charms, so both pins must agree on them
+          if ! jq -e -s 'add | unique | group_by(.charm) | all(length == 1)' pins/*.json > /dev/null; then
+            echo "ERROR: /candidate moved while pinning; start the workflow again." >&2
+            exit 1
+          fi
+
+      - name: Compare with stable
+        id: compare
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          changed=false
+          for product in cos cos-lite; do
+            if ! just solution pin "$product" "origin/${BRANCH}" stable > "stable-${product}.json"; then
+              changed=true
+            elif ! jq -e -n --slurpfile c "pins/${product}.json" --slurpfile s "stable-${product}.json" \
+                '($c[0] | map(del(.channel))) == ($s[0] | map(del(.channel)))' > /dev/null; then
+              changed=true
+            fi
+          done
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          if [ "$changed" = "false" ]; then
+            echo "Nothing to do: /stable already holds the /candidate revisions." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload pins
+        uses: actions/upload-artifact@v4
+        with:
+          name: pins
+          path: pins/
+
+  test:
+    name: Test ${{ matrix.product }} on SolQA
+    needs: [pin]
+    if: needs.pin.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      # SolQA keeps only one waiting run per cluster and cancels older ones
+      max-parallel: 1
+      matrix:
+        product: [cos, cos-lite]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download pins
+        uses: actions/download-artifact@v4
+        with:
+          name: pins
+          path: pins
+
+      - name: Install dependencies
+        run: sudo snap install just --classic
+
+      # The remote executor runs small Go programs
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Build SolQA inputs
+        id: inputs
+        env:
+          PRODUCT: ${{ matrix.product }}
+          CLUSTER: ${{ inputs.cluster }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          # Deploy the branch's modules at /candidate, and run sqa_tests from
+          # this exact commit so the test code is recorded too
+          version_overrides=$(jq -nc --arg ref "$BRANCH" '{cos: {ref: $ref, risk: "candidate"}}')
+          test_parameters=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_SHA" '{repo: $repo, ref: $ref}')
+          jq -nc \
+            --arg product "$PRODUCT" \
+            --arg cluster "$CLUSTER" \
+            --arg version_overrides "$version_overrides" \
+            --arg test_parameters "$test_parameters" \
+            '{
+              type: "solution",
+              substrate: "maas_physical",
+              product: $product,
+              cluster: $cluster,
+              version_overrides: $version_overrides,
+              test_parameters: $test_parameters
+            }' | tee inputs.json
+          {
+            echo 'json<<EOF'
+            cat inputs.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          # A little before now, to allow for clock differences
+          echo "started_at=$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Run on SolQA
+        id: solqa
+        # The run's colour doesn't carry our test result, so carry on and
+        # judge the run by its files
+        continue-on-error: true
+        uses: canonical/sqa-shared-ci/.github/actions/remote_github_workflow_executor@29bf1458526c8b6619bd98a1c0f2d272ee1f7216
+        with:
+          github_token: ${{ secrets.TERRAGRUNT_DEPLOYMENT_PIPELINES_TOKEN }}
+          target_repo_owner: canonical
+          target_repo_name: terragrunt-deployment-pipelines
+          target_workflow: deploy.yaml
+          target_ref: main
+          workflow_inputs_json: ${{ steps.inputs.outputs.json }}
+
+      - name: Download the run's result files
+        env:
+          GH_TOKEN: ${{ secrets.TERRAGRUNT_DEPLOYMENT_PIPELINES_TOKEN }}
+          RUN_ID: ${{ steps.solqa.outputs.run_id }}
+          STARTED_AT: ${{ steps.inputs.outputs.started_at }}
+          EXPECTED_TITLE: "${{ matrix.product }} on maas_physical (${{ inputs.cluster }})"
+        run: |
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: the SolQA run was not started." >&2
+            exit 1
+          fi
+          echo "SolQA run: https://github.com/${SOLQA_REPO}/actions/runs/${RUN_ID}" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The executor follows the newest dispatched run, which could be
+          # someone else's if two were started together
+          run=$(gh api "repos/${SOLQA_REPO}/actions/runs/${RUN_ID}")
+          title=$(jq -r .display_title <<< "$run")
+          created=$(jq -r .created_at <<< "$run")
+          if [ "$title" != "$EXPECTED_TITLE" ] || [[ "$created" < "$STARTED_AT" ]]; then
+            echo "ERROR: run ${RUN_ID} ('${title}', created ${created}) is not the one this job started." >&2
+            exit 1
+          fi
+          mkdir -p results
+          for file in test_results.xml metrics.json; do
+            gh run download "$RUN_ID" -R "$SOLQA_REPO" -n "$file" -D results \
+              || echo "WARNING: run ${RUN_ID} has no ${file}"
+          done
+
+      - name: Check the test result
+        run: |
+          if [ ! -f results/test_results.xml ]; then
+            echo "ERROR: no test result: the lab or pipeline failed before our tests ran. Start the workflow again." >&2
+            exit 1
+          fi
+          python3 - <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse("results/test_results.xml").getroot().iter("testcase")
+          results = {c.get("name"): c.find("failure") is None and c.find("error") is None for c in cases}
+          failed = [name for name, passed in results.items() if not passed]
+          print(f"{len(results)} check(s) ran; failed: {', '.join(failed) or 'none'}")
+          sys.exit(1 if failed or not results else 0)
+          EOF
+
+      - name: Check the deployed revisions
+        run: just solution verify-pin "pins/${{ matrix.product }}.json" results/metrics.json
+
+  release:
+    name: Release to stable
+    needs: [pin, test]
+    if: needs.pin.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment make the release a one-click approval
+    environment: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download pins
+        uses: actions/download-artifact@v4
+        with:
+          name: pins
+          path: pins
+
+      - name: Install dependencies
+        run: |
+          sudo snap install just --classic
+          sudo snap install charmcraft --classic
+
+      - name: Release the pinned revisions
+        env:
+          CHARMCRAFT_AUTH: ${{ secrets.CHARMHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # COS and COS Lite share charms: release each revision once
+          jq -s 'add | unique' pins/cos.json pins/cos-lite.json > all.json
+          just solution release-pinned all.json stable amd64 "$DRY_RUN" | tee -a "$GITHUB_STEP_SUMMARY"

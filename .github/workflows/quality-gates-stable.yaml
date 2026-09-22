@@ -1,0 +1,41 @@
+name: Stable quality gate
+
+# On demand, test the /candidate revisions of every charm in COS and COS Lite
+# on SolQA's lab, and when both products pass, release exactly the tested
+# revisions to /stable (see _quality-gate-stable-branch.yaml for the steps).
+#
+# The `dev` track is never promoted to stable, so only maintenance branches
+# are listed. To gate another track, add its branch to the `branch` matrix.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "SolQA cluster to deploy on (check the workflow-coordinator issues for locks first)"
+        type: choice
+        default: dh1_j8_1
+        options:
+          - dh1_j8_1
+          - dh1_j8_2
+          - dh1_j9_1
+      dry_run:
+        description: "Only print the release commands instead of releasing"
+        type: boolean
+        default: true
+  # Not scheduled yet: add a weekly cron once SolQA agrees on a slot.
+
+jobs:
+  branches:
+    name: ${{ matrix.branch }}
+    strategy:
+      fail-fast: false
+      # Branches share one SolQA cluster
+      max-parallel: 1
+      matrix:
+        branch: [track/3.0]
+    uses: ./.github/workflows/_quality-gate-stable-branch.yaml
+    secrets: inherit
+    with:
+      branch: ${{ matrix.branch }}
+      cluster: ${{ inputs.cluster }}
+      dry_run: ${{ inputs.dry_run }}
