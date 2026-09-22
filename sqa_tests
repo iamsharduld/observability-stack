@@ -1,30 +1,55 @@
-#!/bin/bash
-# Entry point for SolQA's test hook: their Deploy Product pipeline runs this
-# from the repo root once COS or COS Lite is deployed in the "cos" model.
+#!/usr/bin/env bash
+# sqa_tests: entry point for SolQA's "Run SQA tests" step.
 #
-# Runs every check, without stopping at the first failure so one run shows
-# every problem, then writes test_results.xml and metrics.json, which the
-# pipeline uploads as run artifacts. Exits non-zero if any check failed.
-set -u
+# SolQA's Deploy Product pipeline (canonical/terragrunt-deployment-pipelines)
+# deploys COS or COS Lite into the "cos" model, checks out this repo at the ref
+# given in its test_parameters input, and runs ./sqa_tests from here. The name
+# and the outputs are the contract (SolQA's spec SQ088):
+#   - test_results.xml: a JUnit report, next to this script
+#   - metrics.json: free-form; we record what the model actually runs
+#
+# What it does: runs the solution tests (tests/solution) against the deployed
+# model instead of deploying one with Terraform, has pytest write
+# test_results.xml, then records the deployed charm and resource revisions in
+# metrics.json, which the stable quality gate compares with what it pinned.
+#
+# Usage:
+#   ./sqa_tests cos-lite              # the solution to test (default: $PRODUCT,
+#                                     # which the pipeline sets)
+#   ./sqa_tests cos-lite -k metrics   # further arguments go to pytest
+set -euo pipefail
 
-# SolQA's spec (SQ088) expects the result files next to this executable
-cd "$(dirname "$0")" || exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 MODEL="cos"
-CHECKS=(model-active)
+UV_FLAGS=(--frozen --isolated)
 
-logs=$(mktemp -d)
-results="${logs}/results.tsv"
-failed=0
+solution="${1:-${PRODUCT:-}}"
+if [ $# -gt 0 ]; then shift; fi
+case "$solution" in
+    cos | cos-lite) ;;
+    *)
+        echo "ERROR: unknown solution '$solution'; pass cos or cos-lite, or set PRODUCT" >&2
+        exit 1
+        ;;
+esac
 
-for check in "${CHECKS[@]}"; do
-    echo "==> Running check: ${check}"
-    start=$(date +%s)
-    ./tests/sqa/"${check}" 2>&1 | tee "${logs}/${check}.log"
-    code=${PIPESTATUS[0]}
-    printf '%s\t%s\t%s\t%s\n' "${check}" "${code}" "$(($(date +%s) - start))" "${logs}/${check}.log" >> "${results}"
-    [ "${code}" -eq 0 ] || failed=1
-done
+if ! command -v uv &> /dev/null; then
+    echo "Installing astral-uv (snap, provides 'uv')..."
+    sudo snap install astral-uv --classic
+fi
 
-./tests/sqa/report "${results}" "${MODEL}" || failed=1
-exit "${failed}"
+# Run every scenario, then write metrics.json whatever the outcome
+tests_exit=0
+(
+    cd tests/solution
+    SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+        --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
+) || tests_exit=$?
+
+metrics_exit=0
+uv run "${UV_FLAGS[@]}" python tests/sqa/write_metrics.py "$MODEL" metrics.json || metrics_exit=$?
+
+if [ "$tests_exit" -ne 0 ]; then exit "$tests_exit"; fi
+exit "$metrics_exit"

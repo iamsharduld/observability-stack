@@ -7,8 +7,9 @@ name: Test a branch's solutions on SolQA and release them to stable
 #    /stable already holds exactly these.
 # 2. Test: deploy each product at /candidate on SolQA's lab through their
 #    remote executor, running our `sqa_tests` from this commit.
-# 3. Check: judge the run by its test_results.xml, not its colour (SolQA's
-#    test step ignores failures), and check it deployed the pinned revisions.
+# 3. Check: read the run's test_results.xml to confirm our tests actually ran
+#    and passed (a run can be green without running them, and red for lab
+#    reasons), and check it deployed the pinned revisions.
 # 4. Release: after approval through the `stable` environment, release
 #    exactly the pinned revisions to /stable. Releasing by revision, instead
 #    of promoting the channel, keeps anything that reached /candidate during
@@ -141,9 +142,10 @@ jobs:
           BRANCH: ${{ inputs.branch }}
         run: |
           # Deploy the branch's modules at /candidate, and run sqa_tests from
-          # this exact commit so the test code is recorded too
+          # this exact commit (so the test code is recorded too) for this product
           version_overrides=$(jq -nc --arg ref "$BRANCH" '{cos: {ref: $ref, risk: "candidate"}}')
-          test_parameters=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_SHA" '{repo: $repo, ref: $ref}')
+          test_parameters=$(jq -nc --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_SHA" --arg product "$PRODUCT" \
+            '{repo: $repo, ref: $ref, args: [$product]}')
           jq -nc \
             --arg product "$PRODUCT" \
             --arg cluster "$CLUSTER" \
@@ -167,8 +169,8 @@ jobs:
 
       - name: Run on SolQA
         id: solqa
-        # The run's colour doesn't carry our test result, so carry on and
-        # judge the run by its files
+        # A red run may be a lab failure or a test failure: carry on and tell
+        # them apart by the run's files
         continue-on-error: true
         uses: canonical/sqa-shared-ci/.github/actions/remote_github_workflow_executor@29bf1458526c8b6619bd98a1c0f2d272ee1f7216
         with:
