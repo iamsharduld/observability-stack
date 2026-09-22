@@ -1,56 +1,53 @@
 #!/usr/bin/env bash
-# sqa_tests: entry point for SolQA's "Run SQA tests" step.
-#
-# SolQA's Deploy Product pipeline (canonical/terragrunt-deployment-pipelines)
-# deploys COS or COS Lite into the "cos" model, checks out this repo at the ref
-# given in its test_parameters input, and runs ./sqa_tests from here. The name
-# and the outputs are the contract (SolQA's spec SQ088):
-#   - test_results.xml: a JUnit report, next to this script
-#   - metrics.json: free-form; we record what the model actually runs
-#
-# What it does: runs the solution tests (tests/solution) against the deployed
-# model instead of deploying one with Terraform, has pytest write
-# test_results.xml, then records the deployed charm and resource revisions in
-# metrics.json, which the stable quality gate compares with what it pinned.
-#
-# Usage:
-#   ./sqa_tests cos-lite              # the solution to test (default: $PRODUCT,
-#                                     # which the pipeline sets)
-#   ./sqa_tests cos-lite -k metrics   # further arguments go to pytest
-set -euo pipefail
+# TEMPORARY diagnostic for TAP-1522 (not for merging): what can SolQA's runner
+# reach in the deployed COS Lite model? Probes use short timeouts.
+set -u
+MODEL=cos
+hr() { echo; echo "================ $*"; }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
-rm -f test_results.xml metrics.json
+hr runner
+hostname; hostname -I; ip route 2>/dev/null | head -20
+for t in juju kubectl curl python3 jq uv; do printf '%s: ' "$t"; command -v "$t" || echo missing; done
+ls -la ~/.kube 2>/dev/null || echo "no ~/.kube"
 
-MODEL="cos"
-UV_FLAGS=(--frozen --isolated --python 3.12)
+hr juju
+juju whoami
+juju status -m "$MODEL"
 
-solution="${1:-${PRODUCT:-}}"
-if [ $# -gt 0 ]; then shift; fi
-case "$solution" in
-    cos | cos-lite) ;;
-    *)
-        echo "ERROR: unknown solution '$solution'; pass cos or cos-lite, or set PRODUCT" >&2
-        exit 1
-        ;;
-esac
+probe() {  # name url
+    out=$(curl -k -sS -o /dev/null -w '%{http_code} in %{time_total}s' --connect-timeout 5 -m 10 "$2" 2>&1)
+    echo "PROBE $1 $2 -> $out"
+}
 
-if ! command -v uv &> /dev/null; then
-    echo "Installing astral-uv (snap, provides 'uv')..."
-    sudo snap install astral-uv --classic
-fi
+hr "direct probes (unit and service addresses)"
+juju status -m "$MODEL" --format json | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+for app, a in s["applications"].items():
+    for unit, u in a.get("units", {}).items():
+        print(app, u.get("address", ""), a.get("address", ""))
+' | while read -r app unit_ip app_ip; do
+    case "$app" in grafana) p=3000 ;; prometheus) p=9090 ;; loki) p=3100 ;; alertmanager) p=9093 ;; catalogue) p=80 ;; traefik) p=80 ;; *) continue ;; esac
+    for scheme in http https; do
+        probe "$app/unit" "$scheme://$unit_ip:$p"
+        probe "$app/service" "$scheme://$app_ip:$p"
+    done
+done
 
-# Run every scenario, then write metrics.json whatever the outcome
-tests_exit=0
-(
-    cd tests/solution
-    SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
-        --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
-) || tests_exit=$?
+hr "traefik proxied endpoints"
+eps=$(juju run -m "$MODEL" traefik/0 show-proxied-endpoints --format json 2>&1)
+echo "$eps"
+echo "$eps" | grep -oE 'https?://[^"\\ ]+' | sort -u | while read -r url; do
+    probe "ingress" "$url"
+    for path in /api/health /-/ready /ready; do probe "ingress" "${url%/}$path"; done
+done
 
-metrics_exit=0
-uv run "${UV_FLAGS[@]}" python tests/sqa/write_metrics.py "$MODEL" metrics.json || metrics_exit=$?
-
-if [ "$tests_exit" -ne 0 ]; then exit "$tests_exit"; fi
-exit "$metrics_exit"
+hr "checks from inside a unit (juju exec)"
+for target in grafana/0:3000:/api/health prometheus/0:9090:/-/ready loki/0:3100:/ready; do
+    unit=${target%%:*}; rest=${target#*:}; port=${rest%%:*}; path=${rest#*:}
+    for scheme in http https; do
+        echo "EXEC $unit $scheme://localhost:$port$path ->" \
+            "$(timeout 60 juju exec -m "$MODEL" --unit "$unit" -- python3 -c "import ssl,urllib.request as r;print(r.urlopen('$scheme://localhost:$port$path',timeout=5,context=ssl._create_unverified_context()).status)" 2>&1 | tail -1)"
+    done
+done
+exit 0
