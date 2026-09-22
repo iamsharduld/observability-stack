@@ -11,6 +11,8 @@ from typing import Any, Dict
 import jubilant
 import requests
 
+from relay import route
+
 SOLUTION_ROOT = Path(__file__).parent
 
 # Resolved terraform/tofu binary, set by quality-gates.just; falls back to
@@ -65,10 +67,11 @@ def unit_url(juju: jubilant.Juju, app: str, port: int) -> str:
     """
     status = juju.status()
     address = next(iter(status.apps[app].units.values())).address
+    session = route(requests.Session(), juju)
     for scheme in ("https", "http"):
         url = f"{scheme}://{address}:{port}"
         try:
-            requests.get(url, timeout=30, verify=False)
+            session.get(url, timeout=30, verify=False)
         except requests.RequestException:
             continue
         return url

@@ -41,11 +41,13 @@ if ! command -v uv &> /dev/null; then
     sudo snap install astral-uv --classic
 fi
 
-# Run every scenario, then write metrics.json whatever the outcome
+# Run every scenario, then write metrics.json whatever the outcome. SolQA's
+# runner can't reach the cluster's pod network, so the tests send their HTTP
+# requests from inside the grafana unit (see tests/solution/relay.py).
 tests_exit=0
 (
     cd tests/solution
-    SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+    SOLUTION_MODEL="$MODEL" SOLUTION_HTTP_RELAY=grafana uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
         --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
 ) || tests_exit=$?
 

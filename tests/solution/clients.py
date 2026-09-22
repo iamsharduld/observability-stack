@@ -10,6 +10,14 @@ import pytest
 from observability_clients import Alertmanager, Grafana, Loki, Mimir, Prometheus, Tempo
 
 from helpers import leader_unit, unit_url
+from relay import route
+
+
+def _routed(client, juju: jubilant.Juju):
+    """Send the client's requests through the relay unit, if one is configured."""
+    route(client.session, juju)
+    return client
+
 
 _PORTS = {
     "alertmanager": 9093,
@@ -23,7 +31,9 @@ _PORTS = {
 
 @pytest.fixture
 def alertmanager(juju: jubilant.Juju) -> Alertmanager:
-    return Alertmanager(url=unit_url(juju, "alertmanager", _PORTS["alertmanager"]))
+    return _routed(
+        Alertmanager(url=unit_url(juju, "alertmanager", _PORTS["alertmanager"])), juju
+    )
 
 
 @functools.cache
@@ -43,27 +53,30 @@ def _grafana_admin_credentials(model: str) -> str:
 def grafana(juju: jubilant.Juju) -> Grafana:
     """Grafana, authenticated as admin with the charm-generated password."""
     credentials = _grafana_admin_credentials(juju.model)
-    return Grafana(
+    client = Grafana(
         url=unit_url(juju, "grafana", _PORTS["grafana"]),
         headers={"Authorization": f"Basic {credentials}"},
     )
+    return _routed(client, juju)
 
 
 @pytest.fixture
 def loki(juju: jubilant.Juju) -> Loki:
-    return Loki(url=unit_url(juju, "loki", _PORTS["loki"]))
+    return _routed(Loki(url=unit_url(juju, "loki", _PORTS["loki"])), juju)
 
 
 @pytest.fixture
 def mimir(juju: jubilant.Juju) -> Mimir:
-    return Mimir(url=unit_url(juju, "mimir", _PORTS["mimir"]))
+    return _routed(Mimir(url=unit_url(juju, "mimir", _PORTS["mimir"])), juju)
 
 
 @pytest.fixture
 def prometheus(juju: jubilant.Juju) -> Prometheus:
-    return Prometheus(url=unit_url(juju, "prometheus", _PORTS["prometheus"]))
+    return _routed(
+        Prometheus(url=unit_url(juju, "prometheus", _PORTS["prometheus"])), juju
+    )
 
 
 @pytest.fixture
 def tempo(juju: jubilant.Juju) -> Tempo:
-    return Tempo(url=unit_url(juju, "tempo", _PORTS["tempo"]))
+    return _routed(Tempo(url=unit_url(juju, "tempo", _PORTS["tempo"])), juju)
