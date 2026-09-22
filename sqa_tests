@@ -21,9 +21,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+rm -f test_results.xml metrics.json
 
 MODEL="cos"
-UV_FLAGS=(--frozen --isolated)
+UV_FLAGS=(--frozen --isolated --python 3.12)
 
 solution="${1:-${PRODUCT:-}}"
 if [ $# -gt 0 ]; then shift; fi
