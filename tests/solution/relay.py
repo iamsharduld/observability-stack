@@ -1,54 +1,28 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
-"""Send the tests' HTTP requests from inside a unit, for hosts outside the cluster.
+"""Send the tests' HTTP requests with curl from inside a unit.
 
 The steps talk to each workload at its unit address, which only works from
 somewhere that can reach the Kubernetes pod network. SolQA's runners can't
 (see sqa_tests), but they can run commands in units through Juju. Setting
 SOLUTION_HTTP_RELAY to an application name (e.g. "grafana") makes every request
-run from inside that application's leader unit via `juju exec`, where the pod
-network is reachable. Unset, requests go out directly as usual.
+run as `curl` inside that application's leader unit via `juju exec`, like the
+parca-k8s and sloth-k8s integration tests query their servers from another pod.
+Unset, requests go out directly as usual.
 """
 
-import base64
-import json
 import os
+import shlex
 
 import jubilant
 import requests
 from requests.adapters import BaseAdapter
-from requests.structures import CaseInsensitiveDict
 
 _RELAY_ENV_VAR = "SOLUTION_HTTP_RELAY"
 
-# Runs in the relay unit's charm container, so it may only use the standard
-# library. REQUEST is replaced with the base64-encoded request.
-_REMOTE_SCRIPT = """
-import base64, json, ssl, urllib.error, urllib.request
-req = json.loads(base64.b64decode("REQUEST"))
-body = base64.b64decode(req["body"]) if req["body"] else None
-r = urllib.request.Request(
-    req["url"], data=body, headers=req["headers"], method=req["method"]
-)
-context = ssl._create_unverified_context()
-try:
-    resp = urllib.request.urlopen(r, timeout=req["timeout"], context=context)
-except urllib.error.HTTPError as e:
-    resp = e
-except Exception as e:
-    print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
-    raise SystemExit
-print(json.dumps({
-    "status": resp.status,
-    "reason": resp.reason,
-    "headers": dict(resp.headers),
-    "body": base64.b64encode(resp.read()).decode(),
-}))
-"""
-
 
 class JujuExecAdapter(BaseAdapter):
-    """A requests transport that performs each request inside a unit."""
+    """A requests transport that sends each request with curl from inside a unit."""
 
     def __init__(self, juju: jubilant.Juju, unit: str):
         super().__init__()
@@ -60,35 +34,36 @@ class JujuExecAdapter(BaseAdapter):
     ):
         if isinstance(timeout, tuple):
             timeout = timeout[1]
-        body = request.body.encode() if isinstance(request.body, str) else request.body
-        payload = {
-            "method": request.method,
-            "url": request.url,
-            "headers": dict(request.headers),
-            "body": base64.b64encode(body).decode() if body else "",
-            "timeout": timeout or 60,
-        }
-        encoded = base64.b64encode(json.dumps(payload).encode()).decode()
-        script = base64.b64encode(
-            _REMOTE_SCRIPT.replace("REQUEST", encoded).encode()
-        ).decode()
-        command = f'python3 -c \'exec(__import__("base64").b64decode("{script}"))\''
+        command = ["curl", "--silent", "--show-error", "--insecure"]
+        command += ["--max-time", str(timeout or 60), "--request", request.method]
+        # The status code goes on its own last line, after the body
+        command += ["--write-out", "\n%{http_code}"]
+        for name, value in request.headers.items():
+            # requests would decompress a gzipped reply, but this transport
+            # hands back curl's raw output, so ask for an uncompressed one
+            if name.lower() == "accept-encoding":
+                continue
+            command += ["--header", f"{name}: {value}"]
+        if request.body:
+            body = request.body
+            command += [
+                "--data-binary",
+                body.decode() if isinstance(body, bytes) else body,
+            ]
+        command.append(request.url)
         try:
-            task = self.juju.exec(command, unit=self.unit)
-            result = json.loads(task.stdout)
-        except (jubilant.CLIError, jubilant.TaskError, TimeoutError, ValueError) as e:
+            task = self.juju.exec(shlex.join(command), unit=self.unit)
+        except (jubilant.CLIError, jubilant.TaskError, TimeoutError) as e:
+            # curl exits non-zero when it gets no HTTP response at all
             raise requests.ConnectionError(
-                f"relay via {self.unit} failed: {e}", request=request
+                f"curl from {self.unit} failed: {e}", request=request
             ) from e
-        if "error" in result:
-            raise requests.ConnectionError(result["error"], request=request)
 
+        body, _, status = task.stdout.rpartition("\n")
         response = requests.Response()
-        response.status_code = result["status"]
-        response.reason = result["reason"]
-        response.headers = CaseInsensitiveDict(result["headers"])
-        response._content = base64.b64decode(result["body"])
-        response.encoding = requests.utils.get_encoding_from_headers(response.headers)
+        response.status_code = int(status)
+        response._content = body.encode()
+        response.encoding = "utf-8"
         response.url = request.url
         response.request = request
         return response
