@@ -1,53 +1,87 @@
 #!/usr/bin/env bash
-# TEMPORARY diagnostic for TAP-1522 (not for merging): what can SolQA's runner
-# reach in the deployed COS Lite model? Probes use short timeouts.
+# TEMPORARY diagnostic for TAP-1522 (not for merging), v2: the runner's TCP
+# connection to Traefik's load balancer opens but no HTTP reply comes back. Why?
 set -u
 MODEL=cos
 hr() { echo; echo "================ $*"; }
-
-hr runner
-hostname; hostname -I; ip route 2>/dev/null | head -20
-for t in juju kubectl curl python3 jq uv; do printf '%s: ' "$t"; command -v "$t" || echo missing; done
-ls -la ~/.kube 2>/dev/null || echo "no ~/.kube"
-
-hr juju
-juju whoami
-juju status -m "$MODEL"
-
-probe() {  # name url
-    out=$(curl -k -sS -o /dev/null -w '%{http_code} in %{time_total}s' --connect-timeout 5 -m 10 "$2" 2>&1)
-    echo "PROBE $1 $2 -> $out"
+timed_curl() { # label url [curl args...]
+    local label=$1 url=$2
+    shift 2
+    echo "CURL $label $url -> $(curl -sS -o /dev/null --connect-timeout 5 -m 15 "$@" \
+        -w 'code=%{http_code} connect=%{time_connect}s first_byte=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip}:%{remote_port} local=%{local_ip}' \
+        "$url" 2>&1)"
+}
+tcp() { # label host port
+    if timeout 5 bash -c "exec 3<>/dev/tcp/$2/$3" 2> /dev/null; then
+        echo "TCP $1 $2:$3 -> open"
+    else
+        echo "TCP $1 $2:$3 -> no connection"
+    fi
+}
+in_unit() { # unit command
+    echo "EXEC $1: $2"
+    timeout 120 juju exec -m "$MODEL" --unit "$1" -- "$2" 2>&1 | tail -5
 }
 
-hr "direct probes (unit and service addresses)"
-juju status -m "$MODEL" --format json | python3 -c '
-import json, sys
-s = json.load(sys.stdin)
-for app, a in s["applications"].items():
-    for unit, u in a.get("units", {}).items():
-        print(app, u.get("address", ""), a.get("address", ""))
-' | while read -r app unit_ip app_ip; do
-    case "$app" in grafana) p=3000 ;; prometheus) p=9090 ;; loki) p=3100 ;; alertmanager) p=9093 ;; catalogue) p=80 ;; traefik) p=80 ;; *) continue ;; esac
-    for scheme in http https; do
-        probe "$app/unit" "$scheme://$unit_ip:$p"
-        probe "$app/service" "$scheme://$app_ip:$p"
-    done
+hr "wait for the model to settle (max 20 min)"
+query='forEach(applications, app => app.status == "active" && forEach(app.units, unit => unit.workload-status == "active" && unit.agent-status == "idle"))'
+if juju wait-for model "$MODEL" --timeout 20m --query="$query" > /dev/null 2>&1; then echo settled; else echo "not settled, carrying on"; fi
+juju status -m "$MODEL"
+LB=$(juju status -m "$MODEL" traefik --format json | jq -r '.applications.traefik.units[]."workload-status".message' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1)
+echo "Traefik load balancer: $LB"
+
+hr "runner network"
+hostname -I
+ip -br link
+ip -d link show ens3 2> /dev/null | grep -o 'mtu [0-9]*'
+ip route get "$LB"
+ip route get 10.151.11.5
+
+hr "aproxy"
+snap list 2> /dev/null | grep -i aproxy
+for s in $(snap list 2> /dev/null | awk 'tolower($1) ~ /aproxy/ {print $1}'); do sudo snap get "$s" -d 2>&1 | head -20; done
+sudo nft list ruleset 2>&1 | head -80
+
+hr "runner -> traefik load balancer"
+tcp lb "$LB" 80
+tcp lb "$LB" 443
+timed_curl lb-root "http://$LB/"
+timed_curl lb-grafana "http://$LB/cos-grafana/api/health"
+timed_curl lb-https "https://$LB/" -k
+echo "--- verbose"
+curl -v --connect-timeout 5 -m 15 "http://$LB/cos-grafana/api/health" 2>&1 | head -30
+
+hr "path MTU"
+if command -v tracepath > /dev/null; then tracepath -n -m 12 "$LB" 2>&1 | tail -15; else echo "no tracepath"; fi
+for size in 1172 1372 1400 1422 1472; do
+    if ping -c 1 -W 2 -M do -s "$size" "$LB" > /dev/null 2>&1; then echo "PING size=$size DF -> reply"; else echo "PING size=$size DF -> no reply"; fi
 done
 
-hr "traefik proxied endpoints"
-eps=$(juju run -m "$MODEL" traefik/0 show-proxied-endpoints --format json 2>&1)
-echo "$eps"
-echo "$eps" | grep -oE 'https?://[^"\\ ]+' | sort -u | while read -r url; do
-    probe "ingress" "$url"
-    for path in /api/health /-/ready /ready; do probe "ingress" "${url%/}$path"; done
+hr "runner -> other hosts"
+timed_curl juju-controller "https://10.151.11.5:17070/" -k
+juju models 2>&1 | head -10
+k8s_model=$(juju models --format json | jq -r '.models[]."short-name"' | grep -i k8s | head -1)
+echo "kubernetes model: $k8s_model"
+for node in $(juju status -m "$k8s_model" --format json 2> /dev/null | jq -r '.machines[]?."dns-name"' | head -4); do
+    tcp node "$node" 22
+    tcp node "$node" 6443
+    timed_curl node-apiserver "https://$node:6443/healthz" -k
 done
 
-hr "checks from inside a unit (juju exec)"
-for target in grafana/0:3000:/api/health prometheus/0:9090:/-/ready loki/0:3100:/ready; do
-    unit=${target%%:*}; rest=${target#*:}; port=${rest%%:*}; path=${rest#*:}
-    for scheme in http https; do
-        echo "EXEC $unit $scheme://localhost:$port$path ->" \
-            "$(timeout 60 juju exec -m "$MODEL" --unit "$unit" -- python3 -c "import ssl,urllib.request as r;print(r.urlopen('$scheme://localhost:$port$path',timeout=5,context=ssl._create_unverified_context()).status)" 2>&1 | tail -1)"
-    done
-done
+hr "inside the cluster"
+in_unit traefik/0 "curl -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' http://localhost/cos-grafana/api/health"
+in_unit grafana/leader "curl -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' http://$LB/cos-grafana/api/health"
+
+hr "traefik's kubernetes service and pod"
+k8s_get='T=/var/run/secrets/kubernetes.io/serviceaccount/token; curl -sS -k -H "Authorization: Bearer $(cat $T)" https://kubernetes.default.svc/api/v1/namespaces/cos'
+svc=$(in_unit traefik/0 "$k8s_get/services/traefik | python3 -c \"import json,sys; s=json.load(sys.stdin); sp=s.get('spec',{}); print('type', sp.get('type'), 'policy', sp.get('externalTrafficPolicy'), 'ports', [(p.get('port'), p.get('nodePort')) for p in sp.get('ports',[])], 'lb', s.get('status',{}).get('loadBalancer'))\"")
+echo "$svc"
+pod=$(in_unit traefik/0 "$k8s_get/pods/traefik-0 | python3 -c \"import json,sys; s=json.load(sys.stdin)['status']; print('hostIP', s.get('hostIP'), 'podIP', s.get('podIP'))\"")
+echo "$pod"
+host_ip=$(echo "$pod" | grep -oE 'hostIP [0-9.]+' | awk '{print $2}')
+node_port=$(echo "$svc" | grep -oE '\(80, [0-9]+\)' | grep -oE '[0-9]+\)' | tr -d ')')
+if [ -n "$host_ip" ] && [ -n "$node_port" ]; then
+    tcp nodeport "$host_ip" "$node_port"
+    timed_curl nodeport "http://$host_ip:$node_port/cos-grafana/api/health"
+fi
 exit 0
