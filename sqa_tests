@@ -1,87 +1,290 @@
 #!/usr/bin/env bash
-# TEMPORARY diagnostic for TAP-1522 (not for merging), v2: the runner's TCP
-# connection to Traefik's load balancer opens but no HTTP reply comes back. Why?
+# TEMPORARY diagnostic for TAP-1522 (not for merging), v3 ("D4").
+#
+# Question: the runner's TCP connection to Traefik's load balancer address
+# opens, but no reply ever comes back. What accepts that connection, and can
+# the address be reached from anywhere outside the Kubernetes nodes?
+#
+# It looks at the same requests from several places at once:
+#   A. the runner: nftables rules, aproxy, sockets, NAT and a packet capture;
+#   B. a Juju controller machine: a lab machine that isn't a Kubernetes node;
+#   C. the runner again, with the load balancer address taken out of aproxy;
+#   D. the runner, through the Traefik service's node port;
+# while every Kubernetes machine and the controller machine capture packets on
+# their lab network interface.
+#
+# Outside the runner it only reads, and captures packets for a few minutes. On
+# the runner it installs tcpdump/conntrack if missing, and adds the load
+# balancer address to aproxy's exclude set for step C, then removes it.
 set -u
+
 MODEL=cos
-hr() { echo; echo "================ $*"; }
-timed_curl() { # label url [curl args...]
-    local label=$1 url=$2
-    shift 2
-    echo "CURL $label $url -> $(curl -sS -o /dev/null --connect-timeout 5 -m 15 "$@" \
-        -w 'code=%{http_code} connect=%{time_connect}s first_byte=%{time_starttransfer}s total=%{time_total}s remote=%{remote_ip}:%{remote_port} local=%{local_ip}' \
-        "$url" 2>&1)"
+WORK=${D4_WORK:-/tmp}
+PROBE=$WORK/d4probe.py
+ARP=$WORK/d4arp.py
+hr() { echo; echo "================ [$(date -u +%H:%M:%S)Z] $*"; }
+jx() { # model, then juju exec target flags, then -- and the command string
+    local model=$1
+    shift
+    echo "\$ juju exec -m $model ${*:1:2} ..."
+    timeout 300 juju exec -m "$model" "$@" 2>&1
 }
-tcp() { # label host port
-    if timeout 5 bash -c "exec 3<>/dev/tcp/$2/$3" 2> /dev/null; then
-        echo "TCP $1 $2:$3 -> open"
-    else
-        echo "TCP $1 $2:$3 -> no connection"
-    fi
-}
-in_unit() { # unit command
-    echo "EXEC $1: $2"
-    timeout 120 juju exec -m "$MODEL" --unit "$1" -- "$2" 2>&1 | tail -5
-}
+apt_get() { sudo DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y -qq "$@" > /dev/null 2>&1; }
 
-hr "wait for the model to settle (max 20 min)"
+# ---------------------------------------------------------------------------
+# Helper programs
+# ---------------------------------------------------------------------------
+cat > "$PROBE" << 'EOF'
+"""Read "label host port mode" lines; connect to each and report exactly what happens.
+
+mode: connect (only connect), http (send a GET, wait for bytes), banner (wait for bytes).
+"""
+import errno
+import socket
+import sys
+import time
+
+
+def ms(t0):
+    return f"{(time.monotonic() - t0) * 1000:.2f}ms"
+
+
+def probe(host, port, mode):
+    t0 = time.monotonic()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect((host, port))
+    except socket.timeout:
+        return f"connect TIMEOUT after {ms(t0)}"
+    except OSError as e:
+        return f"connect {errno.errorcode.get(e.errno, e.errno)} after {ms(t0)}"
+    local = "%s:%d" % s.getsockname()
+    out = f"connect OK in {ms(t0)} (local {local})"
+    if mode == "http":
+        s.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: d4diag\r\nConnection: close\r\n\r\n".encode())
+    if mode in ("http", "banner"):
+        s.settimeout(8)
+        t1 = time.monotonic()
+        try:
+            data = s.recv(120)
+            if data:
+                out += f"; reply {len(data)} bytes after {ms(t1)}: {data[:70]!r}"
+            else:
+                out += f"; peer CLOSED with 0 bytes after {ms(t1)}"
+        except socket.timeout:
+            out += f"; NO REPLY in {ms(t1)}"
+        except OSError as e:
+            out += f"; reply error {errno.errorcode.get(e.errno, e.errno)} after {ms(t1)}"
+    s.close()
+    return out
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    fields = line.split()
+    if len(fields) != 4:
+        print(f"PROBE skipped (missing value): {line.strip()}", flush=True)
+        continue
+    label, host, port, mode = fields
+    print(f"PROBE {label:22} {host}:{port} [{mode}] -> {probe(host, int(port), mode)}", flush=True)
+EOF
+
+cat > "$ARP" << 'EOF'
+"""Send ARP who-has for each address on an interface and list every MAC that answers."""
+import fcntl
+import socket
+import struct
+import sys
+import time
+
+iface, targets = sys.argv[1], sys.argv[2:]
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+s.bind((iface, 0))
+mac = s.getsockname()[4]
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+src = fcntl.ioctl(u.fileno(), 0x8915, struct.pack("256s", iface[:15].encode()))[20:24]
+print(f"ARP from {iface} {mac.hex(':')} {socket.inet_ntoa(src)}")
+for target in targets:
+    tpa = socket.inet_aton(target)
+    pkt = b"\xff" * 6 + mac + struct.pack("!H", 0x0806)
+    pkt += struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mac + src + b"\x00" * 6 + tpa
+    for _ in range(3):
+        s.send(pkt)
+        time.sleep(0.2)
+    s.settimeout(0.3)
+    seen = {}
+    end = time.time() + 3
+    while time.time() < end:
+        try:
+            data = s.recv(2048)
+        except socket.timeout:
+            continue
+        if len(data) >= 42 and struct.unpack("!H", data[20:22])[0] == 2 and data[28:32] == tpa:
+            sha = data[22:28].hex(":")
+            seen[sha] = seen.get(sha, 0) + 1
+    answer = ", ".join(f"{m} (x{n})" for m, n in seen.items()) or "NO REPLY"
+    print(f"ARP who-has {target}: {answer}")
+EOF
+ARP_B64=$(base64 -w0 "$ARP")
+
+# ---------------------------------------------------------------------------
+hr "0. wait for the cos model to settle (max 8 min)"
 query='forEach(applications, app => app.status == "active" && forEach(app.units, unit => unit.workload-status == "active" && unit.agent-status == "idle"))'
-if juju wait-for model "$MODEL" --timeout 20m --query="$query" > /dev/null 2>&1; then echo settled; else echo "not settled, carrying on"; fi
-juju status -m "$MODEL"
+if juju wait-for model "$MODEL" --timeout 8m --query="$query" > /dev/null 2>&1; then echo settled; else echo "not settled, carrying on"; fi
+
+# ---------------------------------------------------------------------------
+hr "1. discovery"
+juju models 2>&1 | head -20
+K8S_MODEL=$(juju models --format json | jq -r '.models[]."short-name"' | grep -i k8s | head -1)
 LB=$(juju status -m "$MODEL" traefik --format json | jq -r '.applications.traefik.units[]."workload-status".message' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1)
-echo "Traefik load balancer: $LB"
+TRAEFIK_POD=$(juju status -m "$MODEL" traefik --format json | jq -r '.applications.traefik.units[].address' | head -1)
+RUNNER_IP=$(ip -4 -o route get "$LB" | grep -oE 'src [0-9.]+' | awk '{print $2}')
+POOL_OTHER=$(echo "$LB" | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4 + 1}')
+mapfile -t NODES < <(juju status -m "$K8S_MODEL" --format json | jq -r '.machines[]."dns-name"')
+NODE1=${NODES[0]:-}
+CTRL_IP=$(juju status -m controller --format json 2> /dev/null | jq -r '.machines["0"]."dns-name"')
+echo "k8s model:        $K8S_MODEL"
+echo "load balancer:    $LB (another pool address: $POOL_OTHER)"
+echo "traefik pod:      $TRAEFIK_POD"
+echo "runner:           $RUNNER_IP ($(hostname))"
+echo "k8s machines:     ${NODES[*]}"
+echo "controller m0:    $CTRL_IP"
+juju status -m "$K8S_MODEL" 2>&1 | sed -n '/^Machine/,$p' | head -12
 
-hr "runner network"
-hostname -I
-ip -br link
-ip -d link show ens3 2> /dev/null | grep -o 'mtu [0-9]*'
+KUBE="/snap/bin/k8s kubectl"
+SVC_INFO=$(jx "$K8S_MODEL" --unit k8s/leader -- "$KUBE get svc -n $MODEL traefik-lb -o jsonpath='{.spec.type} {.spec.externalTrafficPolicy} {.status.loadBalancer.ingress[*].ip} {range .spec.ports[*]}{.port}:{.nodePort} {end}'")
+echo "traefik-lb service: $SVC_INFO"
+NODEPORT=$(echo "$SVC_INFO" | grep -oE '(^| )80:[0-9]+' | head -1 | cut -d: -f2)
+echo "node port for 80: ${NODEPORT:-none}"
+jx "$K8S_MODEL" --unit k8s/leader -- "/snap/bin/k8s get load-balancer; echo; $KUBE get svc -A -o wide | grep -E 'LoadBalancer|NAME'; echo; $KUBE get pod -n $MODEL traefik-0 -o wide; echo; $KUBE get lease -n kube-system | grep -iE 'NAME|l2announce'; echo; $KUBE get ciliumloadbalancerippools -o yaml 2>&1 | grep -E 'name:|cidr|start|stop|blocks' ; $KUBE get ciliuml2announcementpolicies -o yaml 2>&1 | grep -vE 'uid|resourceVersion|creationTimestamp|generation|managedFields' | head -40"
+
+# ---------------------------------------------------------------------------
+hr "2. where each machine sits on the network"
+echo "--- runner"
+ip -4 -br addr
+ip route
 ip route get "$LB"
-ip route get 10.151.11.5
+echo "--- k8s machines (address, MAC, routes, route to the load balancer)"
+jx "$K8S_MODEL" --all -- "ip -4 -br addr | grep -v -E '^(lo|cilium|lxc)'; ip -br link | grep -v -E '^(lo|cilium|lxc)'; ip route | grep -v -E 'cilium|lxc'; ip route get $LB"
+echo "--- controller machine 0"
+jx controller --machine 0 -- "ip -4 -br addr | grep -v '^lo'; ip -br link | grep -v '^lo'; ip route; ip route get $LB"
 
-hr "aproxy"
+# ---------------------------------------------------------------------------
+hr "3. the runner's aproxy and nftables, in full"
 snap list 2> /dev/null | grep -i aproxy
-for s in $(snap list 2> /dev/null | awk 'tolower($1) ~ /aproxy/ {print $1}'); do sudo snap get "$s" -d 2>&1 | head -20; done
-sudo nft list ruleset 2>&1 | head -80
+for s in $(snap list 2> /dev/null | awk 'tolower($1) ~ /aproxy/ {print $1}'); do echo "--- snap get $s"; sudo snap get "$s" -d 2>&1; done
+echo "--- nft list tables"
+sudo nft list tables 2>&1
+echo "--- nft list table ip aproxy"
+sudo nft list table ip aproxy 2>&1
+APROXY_SET=$(sudo nft -j list table ip aproxy 2> /dev/null | jq -r '.nftables[] | select(.set) | .set.name' | head -1)
+echo "aproxy exclude set name: ${APROXY_SET:-none}"
+echo "--- proxy settings in the environment"
+env | grep -i -E '^(https?|no|all)_proxy=' || echo "none"
+echo "CLUSTER=${CLUSTER:-} SUBSTRATE=${SUBSTRATE:-} JUJU_CHANNEL=${JUJU_CHANNEL:-}"
+echo "--- egress proxy address"
+getent hosts egress.ps7.internal
 
-hr "runner -> traefik load balancer"
-tcp lb "$LB" 80
-tcp lb "$LB" 443
-timed_curl lb-root "http://$LB/"
-timed_curl lb-grafana "http://$LB/cos-grafana/api/health"
-timed_curl lb-https "https://$LB/" -k
-echo "--- verbose"
-curl -v --connect-timeout 5 -m 15 "http://$LB/cos-grafana/api/health" 2>&1 | head -30
+# ---------------------------------------------------------------------------
+hr "4. start packet captures (runner, every k8s machine, controller machine 0)"
+command -v tcpdump > /dev/null || apt_get tcpdump
+command -v conntrack > /dev/null || apt_get conntrack
+command -v tcpdump conntrack
+FILTER_RUNNER="host $LB or host $POOL_OTHER or net 10.241.146.0/24 or tcp port 3128 or tcp port 54969 or tcp port 54970"
+[ -n "$NODEPORT" ] && FILTER_RUNNER="$FILTER_RUNNER or (host $NODE1 and tcp port $NODEPORT)"
+# shellcheck disable=SC2024 # the log only needs to be readable by us
+sudo tcpdump -U -Z root -nn -i any -s 256 -w "$WORK/d4-runner.pcap" "$FILTER_RUNNER" > "$WORK/d4-runner-tcpdump.log" 2>&1 &
+# On the lab machines: every packet to/from the load balancer address (ARP
+# included) or the runner on the lab interface, except Juju's API traffic.
+REMOTE_CAP="IFACE=\$(ip -4 -o addr show | awk '\$4 ~ /^10\\.241\\./ {print \$2; exit}'); echo \"capturing on \$IFACE\"; command -v tcpdump > /dev/null || (DEBIAN_FRONTEND=noninteractive timeout 90 apt-get install -y -qq tcpdump > /dev/null 2>&1); command -v tcpdump || echo 'NO TCPDUMP'; setsid nohup timeout 1200 tcpdump -U -Z root -nn -i \"\$IFACE\" -s 256 -w /tmp/d4.pcap '(host $LB or host $RUNNER_IP) and not tcp port 17070' > /tmp/d4-tcpdump.log 2>&1 < /dev/null & sleep 2; cat /tmp/d4-tcpdump.log"
+jx "$K8S_MODEL" --all -- "$REMOTE_CAP"
+jx controller --machine 0 -- "$REMOTE_CAP"
+sleep 3
+cat "$WORK/d4-runner-tcpdump.log"
 
-hr "path MTU"
-if command -v tracepath > /dev/null; then tracepath -n -m 12 "$LB" 2>&1 | tail -15; else echo "no tracepath"; fi
-for size in 1172 1372 1400 1422 1472; do
-    if ping -c 1 -W 2 -M do -s "$size" "$LB" > /dev/null 2>&1; then echo "PING size=$size DF -> reply"; else echo "PING size=$size DF -> no reply"; fi
-done
+# ---------------------------------------------------------------------------
+hr "5. A: from the runner, as it is"
+python3 "$PROBE" << EOF
+lb-http $LB 80 http
+lb-https $LB 443 connect
+lb-8080 $LB 8080 connect
+lb-ssh $LB 22 banner
+pool-other-http $POOL_OTHER 80 http
+lbnet-random-80 10.241.146.201 80 http
+lbnet-random-8080 10.241.146.201 8080 connect
+nodenet-random-80 10.241.39.201 80 http
+nodenet-random-8080 10.241.39.201 8080 connect
+node-ssh $NODE1 22 banner
+node-80 $NODE1 80 http
+node-6443 $NODE1 6443 connect
+pod-80 $TRAEFIK_POD 80 http
+EOF
+for n in "${NODES[@]:1}"; do echo "node-ssh $n 22 banner"; done | python3 "$PROBE"
 
-hr "runner -> other hosts"
-timed_curl juju-controller "https://10.151.11.5:17070/" -k
-juju models 2>&1 | head -10
-k8s_model=$(juju models --format json | jq -r '.models[]."short-name"' | grep -i k8s | head -1)
-echo "kubernetes model: $k8s_model"
-for node in $(juju status -m "$k8s_model" --format json 2> /dev/null | jq -r '.machines[]?."dns-name"' | head -4); do
-    tcp node "$node" 22
-    tcp node "$node" 6443
-    timed_curl node-apiserver "https://$node:6443/healthz" -k
-done
+echo "--- curl -v to the load balancer (15 s)"
+curl --noproxy '*' -v --connect-timeout 5 -m 15 "http://$LB/cos-grafana/api/health" 2>&1 | head -20
 
-hr "inside the cluster"
-in_unit traefik/0 "curl -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' http://localhost/cos-grafana/api/health"
-in_unit grafana/leader "curl -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' http://$LB/cos-grafana/api/health"
+echo "--- sockets and NAT while a request to the load balancer hangs"
+curl --noproxy '*' -sS -m 25 -o /dev/null "http://$LB/cos-grafana/api/health" > /dev/null 2>&1 &
+HANG_PID=$!
+sleep 4
+sudo ss -tnpi | grep -E -A1 "$LB|:54969|:54970|:3128" | head -30
+sudo conntrack -L -p tcp --orig-dst "$LB" 2>&1 | head -10
+wait "$HANG_PID"
 
-hr "traefik's kubernetes service and pod"
-k8s_get='T=/var/run/secrets/kubernetes.io/serviceaccount/token; curl -sS -k -H "Authorization: Bearer $(cat $T)" https://kubernetes.default.svc/api/v1/namespaces/cos'
-svc=$(in_unit traefik/0 "$k8s_get/services/traefik | python3 -c \"import json,sys; s=json.load(sys.stdin); sp=s.get('spec',{}); print('type', sp.get('type'), 'policy', sp.get('externalTrafficPolicy'), 'ports', [(p.get('port'), p.get('nodePort')) for p in sp.get('ports',[])], 'lb', s.get('status',{}).get('loadBalancer'))\"")
-echo "$svc"
-pod=$(in_unit traefik/0 "$k8s_get/pods/traefik-0 | python3 -c \"import json,sys; s=json.load(sys.stdin)['status']; print('hostIP', s.get('hostIP'), 'podIP', s.get('podIP'))\"")
-echo "$pod"
-host_ip=$(echo "$pod" | grep -oE 'hostIP [0-9.]+' | awk '{print $2}')
-node_port=$(echo "$svc" | grep -oE '\(80, [0-9]+\)' | grep -oE '[0-9]+\)' | tr -d ')')
-if [ -n "$host_ip" ] && [ -n "$node_port" ]; then
-    tcp nodeport "$host_ip" "$node_port"
-    timed_curl nodeport "http://$host_ip:$node_port/cos-grafana/api/health"
+echo "--- the same request sent straight to the egress proxy (max 75 s)"
+curl -sS -m 75 -o /dev/null -D - -x http://egress.ps7.internal:3128 "http://$LB/cos-grafana/api/health" \
+    -w 'code=%{http_code} total=%{time_total}s\n' 2>&1 | grep -iE '^HTTP|^X-Squid|^Via|code=|curl:'
+
+echo "--- aproxy logs"
+for s in $(snap list 2> /dev/null | awk 'tolower($1) ~ /aproxy/ {print $1}'); do echo "--- $s"; sudo snap logs "$s" -n 40 2>&1 | grep -E "$LB|10\.241\.146|error|fail" | tail -20; done
+
+# ---------------------------------------------------------------------------
+hr "6. B: from controller machine 0 (a lab machine that isn't a k8s node)"
+jx controller --machine 0 -- "for u in http://$LB/cos-grafana/api/health ${NODEPORT:+http://$NODE1:$NODEPORT/cos-grafana/api/health}; do echo \"CURL \$u -> \$(curl --noproxy '*' -sS -o /dev/null -m 10 -w 'code=%{http_code} connect=%{time_connect}s total=%{time_total}s' \$u 2>&1)\"; done; IFACE=\$(ip -4 -o addr show | awk '\$4 ~ /^10\\.241\\./ {print \$2; exit}'); echo $ARP_B64 | base64 -d > /tmp/d4arp.py; python3 /tmp/d4arp.py \"\$IFACE\" $LB $POOL_OTHER $NODE1 10.241.144.1; ip neigh show | grep -E '$LB|$POOL_OTHER|10.241.144.1 '"
+
+# ---------------------------------------------------------------------------
+hr "7. C: from the runner, with $LB taken out of aproxy (one change)"
+if [ -n "$APROXY_SET" ]; then
+    sudo nft add element ip aproxy "$APROXY_SET" "{ $LB }" 2>&1
+    sudo nft list set ip aproxy "$APROXY_SET" 2>&1 | grep -E 'elements|\}' | head -5
+    python3 "$PROBE" << EOF
+lb-http-bypass $LB 80 http
+lb-https-bypass $LB 443 connect
+pool-other-http $POOL_OTHER 80 http
+EOF
+    echo "--- curl -v, bypassing aproxy"
+    curl --noproxy '*' -v --connect-timeout 5 -m 15 "http://$LB/cos-grafana/api/health" 2>&1 | head -20
+    sudo nft delete element ip aproxy "$APROXY_SET" "{ $LB }" 2>&1 && echo "removed $LB from the aproxy exclude set again"
+else
+    echo "no aproxy exclude set found: step skipped"
 fi
+
+# ---------------------------------------------------------------------------
+hr "8. D: from the runner, through Traefik's node port"
+if [ -n "$NODEPORT" ]; then
+    for n in "${NODES[@]}"; do
+        echo "CURL http://$n:$NODEPORT/cos-grafana/api/health -> $(curl --noproxy '*' -sS -o /dev/null -m 10 -w 'code=%{http_code} connect=%{time_connect}s total=%{time_total}s' "http://$n:$NODEPORT/cos-grafana/api/health" 2>&1)"
+    done
+else
+    echo "no node port: step skipped"
+fi
+
+hr "9. control: inside the cluster, grafana to the load balancer"
+jx "$MODEL" --unit grafana/leader -- "curl --noproxy '*' -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' http://$LB/cos-grafana/api/health"
+
+# ---------------------------------------------------------------------------
+hr "10. stop captures and print them"
+sleep 3
+sudo pkill -INT -f '^tcpdump -U -Z root -nn -i any'
+sleep 2
+echo "--- runner capture (interface, direction, packet)"
+sudo tcpdump -nn -tttt -r "$WORK/d4-runner.pcap" 2> /dev/null | head -250
+STOP_READ="pkill -INT -f '^tcpdump -U -Z root -nn -i'; sleep 2; echo \"packets: \$(tcpdump -nn -r /tmp/d4.pcap 2> /dev/null | wc -l)\"; tcpdump -nn -e -tttt -r /tmp/d4.pcap 2> /dev/null | head -120; rm -f /tmp/d4.pcap /tmp/d4-tcpdump.log /tmp/d4arp.py"
+echo "--- k8s machines' captures"
+jx "$K8S_MODEL" --all -- "$STOP_READ"
+echo "--- controller machine 0 capture"
+jx controller --machine 0 -- "$STOP_READ"
 exit 0
