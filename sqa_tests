@@ -1,22 +1,7 @@
 #!/usr/bin/env bash
-# sqa_tests: entry point for SolQA's "Run SQA tests" step.
-#
-# SolQA's Deploy Product pipeline (canonical/terragrunt-deployment-pipelines)
-# deploys COS or COS Lite into the "cos" model, checks out this repo at the ref
-# given in its test_parameters input, and runs ./sqa_tests from here. The name
-# and the outputs are the contract (SolQA's spec SQ088):
-#   - test_results.xml: a JUnit report, next to this script
-#   - metrics.json: free-form; we record what the model actually runs
-#
-# What it does: runs the solution tests (tests/solution) against the deployed
-# model instead of deploying one with Terraform, has pytest write
-# test_results.xml, then records the deployed charm and resource revisions in
-# metrics.json, which the stable quality gate releases from.
-#
-# Usage:
-#   ./sqa_tests cos-lite              # the solution to test (default: $PRODUCT,
-#                                     # which the pipeline sets)
-#   ./sqa_tests cos-lite -k metrics   # further arguments go to pytest
+# SolQA entry point: test the deployed "cos" model and record its revisions.
+# Outputs: test_results.xml (JUnit) and metrics.json (tested revisions).
+# Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,9 +26,8 @@ if ! command -v uv &> /dev/null; then
     sudo snap install astral-uv --classic
 fi
 
-# Run every scenario, then write metrics.json whatever the outcome. SolQA's
-# runner can't reach the cluster's pod network, so the tests send their HTTP
-# requests from inside the grafana unit (see tests/solution/relay.py).
+# SolQA cannot reach the pod network; relay HTTP requests through Grafana.
+# Always write metrics, preserving the test exit code if tests fail.
 tests_exit=0
 (
     cd tests/solution

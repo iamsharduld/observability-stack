@@ -99,9 +99,7 @@ charm-tracks module ref='main':
     [ -n "$track" ] && printf '%s %s\n' "$charm" "$track"
   done <<< "$charm_keys"
 
-# Print, as JSON, the exact revisions and resource revisions that every charm
-# pinned by a product module has in <track>/<risk> right now. The stable gate
-# uses it to skip testing when /stable already holds the /candidate revisions.
+# Snapshot charm and resource revisions to compare candidate with stable.
 [group("promote")]
 pin module="cos-lite" ref="main" risk="candidate":
   #!/usr/bin/env bash
@@ -114,11 +112,9 @@ pin module="cos-lite" ref="main" risk="candidate":
   fields="channel-map.channel.name,channel-map.channel.base.name,channel-map.channel.base.channel"
   fields+=",channel-map.channel.base.architecture,channel-map.revision.revision"
   fields+=",default-release.resources.name,default-release.resources.revision"
-  pins=$(while read -r charm track; do
+  while read -r charm track; do
     channel="${track}/{{risk}}"
-    # The `channel` parameter narrows the channel map down to that channel. The
-    # default release (and so its resources) is the amd64 one: the public API
-    # doesn't show resources for other architectures.
+    # The public API exposes resources for the default (amd64) release only.
     info=$(curl -fsS --get "https://api.charmhub.io/v2/charms/info/${charm}" \
       --data-urlencode "channel=${channel}" --data-urlencode "fields=${fields}")
     jq -c --arg charm "$charm" --arg track "$track" --arg channel "$channel" '{
@@ -132,18 +128,12 @@ pin module="cos-lite" ref="main" risk="candidate":
       }] | unique,
       resources: [.["default-release"].resources[]? | {name, revision}] | sort_by(.name)
     }' <<< "$info"
-  done <<< "$charms_tracks")
-  jq -s '
+  done <<< "$charms_tracks" | jq -s '
     [.[] | select(.revisions == []) | .channel + " (" + .charm + ")"] as $empty
     | if $empty != [] then error("nothing released in: " + ($empty | join(", "))) else . end
-  ' <<< "$pins"
+  '
 
-# Print, in the same format as `pin`, the revisions and resource revisions that
-# a SolQA run deployed, and so tested, for every charm the product module pins.
-# The stable gate releases exactly these. The metrics file is the metrics.json
-# that `sqa_tests` writes and SolQA uploads as a run artifact. Fails if a charm
-# wasn't deployed from <track>/<risk>, or if its applications run different
-# revisions. SolQA's lab only has amd64 machines, hence the `arch` default.
+# Build a release manifest from SolQA's metrics.json; all matching apps must agree.
 [group("promote")]
 tested module ref metrics_file risk="candidate" arch="amd64":
   #!/usr/bin/env bash
@@ -154,30 +144,24 @@ tested module ref metrics_file risk="candidate" arch="amd64":
     exit 1
   fi
   while read -r charm track; do
-    jq -n --arg charm "$charm" --arg track "$track" --arg channel "${track}/{{risk}}" \
-      '{charm: $charm, track: $track, channel: $channel}'
-  done <<< "$charms_tracks" | jq -s --slurpfile metrics "{{metrics_file}}" --arg arch "{{arch}}" '
-    [$metrics[0].applications // {} | .[]] as $apps
-    | map(. as $c
-      | [$apps[] | select(.charm == $c.charm)] as $deployed
-      | ([$deployed[].channel] | unique) as $channels
-      | if $deployed == [] then error("\($c.charm) was not deployed")
-        elif $channels != [$c.channel] then
-          error("\($c.charm) was deployed from \($channels | join(", ")), not \($c.channel)")
-        elif ([$deployed[] | [.revision, .resources]] | unique | length) > 1 then
-          error("the applications using \($c.charm) run different revisions")
-        else $c + {
-          revisions: [{revision: $deployed[0].revision, architecture: $arch}],
-          resources: [$deployed[0].resources | to_entries[] | {name: .key, revision: .value}]
-            | sort_by(.name)
-        } end)
-  '
+    jq --arg charm "$charm" --arg track "$track" \
+       --arg channel "${track}/{{risk}}" --arg arch "{{arch}}" '
+      [.applications[]? | select(.charm == $charm) | {channel, revision, resources}] | unique
+      | if length == 0 then error("\($charm) was not deployed")
+        elif any(.channel != $channel) then error("\($charm) was not deployed from \($channel)")
+        elif length > 1 then error("the applications using \($charm) run different revisions")
+        else .[0] end
+      | {
+          charm: $charm,
+          track: $track,
+          channel: $channel,
+          revisions: [{revision: .revision, architecture: $arch}],
+          resources: (.resources | to_entries | map({name: .key, revision: .value}) | sort_by(.name))
+        }
+    ' "{{metrics_file}}"
+  done <<< "$charms_tracks" | jq -s .
 
-# Release exactly the revisions and resources recorded by `pin` or `tested` to
-# <track>/<to_risk>, one `charmcraft release` per revision. Only the
-# architectures in `archs` are released: SolQA's lab only tests amd64, and the
-# pin only knows amd64 resources, so other revisions are listed for a person
-# to handle. Only prints the commands unless dry_run is "false".
+# Release recorded revisions and resources; SolQA tests amd64 only. Dry run by default.
 [group("promote")]
 release-pinned pin_file to_risk="stable" archs="amd64" dry_run="true":
   #!/usr/bin/env bash
@@ -187,13 +171,11 @@ release-pinned pin_file to_risk="stable" archs="amd64" dry_run="true":
   else
     echo "==> Dry run: printing the release commands only (pass dry_run=false to release)"
   fi
-  releases=$(jq -r --arg risk "{{to_risk}}" --arg archs "{{archs}}" '
-    ($archs | split(" ")) as $allowed
-    | .[] as $c
-    | $c.revisions[]
-    | [(if .architecture | IN($allowed[]) then "release" else "skip" end),
-       $c.charm, (.revision | tostring), .architecture, "\($c.track)/\($risk)"]
-      + [$c.resources[] | "\(.name):\(.revision)"]
+  releases=$(jq -r --arg risk "{{to_risk}}" '
+    .[] as $charm
+    | $charm.revisions[]
+    | [$charm.charm, (.revision | tostring), .architecture, "\($charm.track)/\($risk)"]
+      + [$charm.resources[] | "\(.name):\(.revision)"]
     | @tsv
   ' "{{pin_file}}")
   if [ -z "$releases" ]; then
@@ -202,14 +184,15 @@ release-pinned pin_file to_risk="stable" archs="amd64" dry_run="true":
   fi
   skipped=0
   while IFS=$'\t' read -r -a fields; do
-    action=${fields[0]} charm=${fields[1]} revision=${fields[2]} arch=${fields[3]} channel=${fields[4]}
-    if [ "$action" = "skip" ]; then
+    charm=${fields[0]} revision=${fields[1]}
+    arch=${fields[2]} channel=${fields[3]}
+    if [[ " {{archs}} " != *" $arch "* ]]; then
       echo "--> Skipping $charm revision $revision ($arch): not tested; release it by hand if intended"
       skipped=$((skipped + 1))
       continue
     fi
     args=(release "$charm" --revision "$revision" --channel "$channel")
-    for resource in "${fields[@]:5}"; do args+=(--resource "$resource"); done
+    for resource in "${fields[@]:4}"; do args+=(--resource "$resource"); done
     echo "--> charmcraft ${args[*]}"
     if [ "{{dry_run}}" = "false" ]; then charmcraft "${args[@]}"; fi
   done <<< "$releases"
