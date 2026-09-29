@@ -1,4 +1,58 @@
-#!/bin/bash
-set -eu
+#!/usr/bin/env bash
+# sqa_tests: entry point for SolQA's "Run SQA tests" step.
+#
+# SolQA's Deploy Product pipeline (canonical/terragrunt-deployment-pipelines)
+# deploys COS or COS Lite into the "cos" model, checks out this repo at the ref
+# given in its test_parameters input, and runs ./sqa_tests from here. The name
+# and the outputs are the contract (SolQA's spec SQ088):
+#   - test_results.xml: a JUnit report, next to this script
+#   - metrics.json: free-form; we record what the model actually runs
+#
+# What it does: runs the solution tests (tests/solution) against the deployed
+# model instead of deploying one with Terraform, has pytest write
+# test_results.xml, then records the deployed charm and resource revisions in
+# metrics.json, which the stable quality gate releases from.
+#
+# Usage:
+#   ./sqa_tests cos-lite              # the solution to test (default: $PRODUCT,
+#                                     # which the pipeline sets)
+#   ./sqa_tests cos-lite -k metrics   # further arguments go to pytest
+set -euo pipefail
 
-./tests/sqa/model-active
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+rm -f test_results.xml metrics.json
+
+MODEL="cos"
+UV_FLAGS=(--frozen --isolated --python 3.12)
+
+solution="${1:-${PRODUCT:-}}"
+if [ $# -gt 0 ]; then shift; fi
+case "$solution" in
+    cos | cos-lite) ;;
+    *)
+        echo "ERROR: unknown solution '$solution'; pass cos or cos-lite, or set PRODUCT" >&2
+        exit 1
+        ;;
+esac
+
+if ! command -v uv &> /dev/null; then
+    echo "Installing astral-uv (snap, provides 'uv')..."
+    sudo snap install astral-uv --classic
+fi
+
+# Run every scenario, then write metrics.json whatever the outcome. SolQA's
+# runner can't reach the cluster's pod network, so the tests send their HTTP
+# requests from inside the grafana unit (see tests/solution/relay.py).
+tests_exit=0
+(
+    cd tests/solution
+    SOLUTION_MODEL="$MODEL" SOLUTION_HTTP_RELAY=grafana uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+        --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
+) || tests_exit=$?
+
+metrics_exit=0
+uv run "${UV_FLAGS[@]}" python tests/sqa/write_metrics.py "$MODEL" metrics.json || metrics_exit=$?
+
+if [ "$tests_exit" -ne 0 ]; then exit "$tests_exit"; fi
+exit "$metrics_exit"
