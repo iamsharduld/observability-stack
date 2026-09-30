@@ -99,3 +99,13 @@ add retries where data genuinely trails active/idle (e.g. the first Prometheus s
    ```
 4. Run `just solution test <name>` to verify it.
 
+## Running on SolQA
+
+The stable quality gate (`.github/workflows/quality-gates-stable.yaml`) runs these tests on
+Solutions QA's lab through `sqa_tests` at the repo root. SolQA deploys the product from
+`candidate`, runs `./sqa_tests <cos|cos-lite>`, and keeps `test_results.xml` with the run.
+
+SolQA's runner can't reach the applications over HTTP yet
+([terragrunt-deployment-pipelines#235](https://github.com/canonical/terragrunt-deployment-pipelines/issues/235)),
+so `sqa_tests` sets `SOLUTION_HTTP_RELAY=grafana`: the tests' HTTP requests are sent with `curl`
+from inside the Grafana unit (`relay.py`). This is temporary and goes away once #235 is fixed.

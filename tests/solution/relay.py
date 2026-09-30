@@ -2,8 +2,15 @@
 # See LICENSE file for licensing details.
 """Relay HTTP requests into the pod network for runners without direct access.
 
+TEMPORARY, for SolQA only. SolQA's runner can't reach COS over HTTP: the pod
+addresses aren't routable from it, and in SolQA's COS setup Traefik's load
+balancer address is never announced outside the Kubernetes cluster
+(https://github.com/canonical/terragrunt-deployment-pipelines/issues/235).
+Delete this module and SOLUTION_HTTP_RELAY in sqa_tests once that is fixed.
+
 Set SOLUTION_HTTP_RELAY to an application name to run curl in its leader unit
-via juju exec. Leave it unset to send requests directly.
+via juju exec. Leave it unset (the default, for CI and local runs) to send
+requests directly.
 """
 
 import os

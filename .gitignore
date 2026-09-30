@@ -34,6 +34,5 @@ terraform.rc
 .terraform.lock.hcl
 
 terraform/testing/**
-# SolQA test outputs (see sqa_tests)
+# SolQA test output (see sqa_tests)
 test_results.xml
-metrics.json

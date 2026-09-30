@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# SolQA entry point: test the deployed "cos" model and record its revisions.
-# Outputs: test_results.xml (JUnit) and metrics.json (tested revisions).
+# SolQA entry point: run the solution tests against the deployed "cos" model.
+# Output: test_results.xml (JUnit), which SolQA keeps with the run.
+# Exit code: pytest's, so SolQA's "Run SQA tests" step fails if any test fails.
 # Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-rm -f test_results.xml metrics.json
+rm -f test_results.xml
 
 MODEL="cos"
+# SolQA's runners have Python 3.10; the tests need 3.12.
 UV_FLAGS=(--frozen --isolated --python 3.12)
 
 solution="${1:-${PRODUCT:-}}"
@@ -26,17 +28,10 @@ if ! command -v uv &> /dev/null; then
     sudo snap install astral-uv --classic
 fi
 
-# SolQA cannot reach the pod network; relay HTTP requests through Grafana.
-# Always write metrics, preserving the test exit code if tests fail.
-tests_exit=0
-(
-    cd tests/solution
-    SOLUTION_MODEL="$MODEL" SOLUTION_HTTP_RELAY=grafana uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
-        --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
-) || tests_exit=$?
-
-metrics_exit=0
-uv run "${UV_FLAGS[@]}" python tests/sqa/write_metrics.py "$MODEL" metrics.json || metrics_exit=$?
-
-if [ "$tests_exit" -ne 0 ]; then exit "$tests_exit"; fi
-exit "$metrics_exit"
+# TEMPORARY: SolQA's runner can't reach the applications over HTTP
+# (https://github.com/canonical/terragrunt-deployment-pipelines/issues/235), so
+# the tests send their requests from inside the Grafana unit with `juju exec`
+# (tests/solution/relay.py). Drop SOLUTION_HTTP_RELAY once #235 is fixed.
+cd tests/solution
+SOLUTION_MODEL="$MODEL" SOLUTION_HTTP_RELAY=grafana uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+    --junitxml="$SCRIPT_DIR/test_results.xml" "$@"

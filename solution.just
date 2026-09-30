@@ -99,7 +99,7 @@ charm-tracks module ref='main':
     [ -n "$track" ] && printf '%s %s\n' "$charm" "$track"
   done <<< "$charm_keys"
 
-# Snapshot charm and resource revisions to compare candidate with stable.
+# List the charm and resource revisions in each charm's <track>/<risk> channel for a product module.
 [group("promote")]
 pin module="cos-lite" ref="main" risk="candidate":
   #!/usr/bin/env bash
@@ -133,67 +133,104 @@ pin module="cos-lite" ref="main" risk="candidate":
     | if $empty != [] then error("nothing released in: " + ($empty | join(", "))) else . end
   '
 
-# Build a release manifest from SolQA's metrics.json; all matching apps must agree.
+# Nothing in stable yet for a charm also counts as a change.
+# Print "true" if a product module's charms differ between <track>/candidate and <track>/stable, else "false".
 [group("promote")]
-tested module ref metrics_file risk="candidate" arch="amd64":
+candidate-changed module ref:
   #!/usr/bin/env bash
   set -euo pipefail
-  charms_tracks=$(just solution charm-tracks "{{module}}" "{{ref}}")
-  if [ -z "$charms_tracks" ]; then
-    echo "ERROR: no pinned charms found for module '{{module}}' at '{{ref}}'" >&2
+  candidate=$(just solution pin "{{module}}" "{{ref}}" candidate)
+  if ! stable=$(just solution pin "{{module}}" "{{ref}}" stable 2> /dev/null); then
+    echo true
+    exit 0
+  fi
+  jq -n --argjson c "$candidate" --argjson s "$stable" \
+    '($c | map(del(.channel))) != ($s | map(del(.channel)))'
+
+# Only if candidate still matches the snapshot taken before testing
+# (`just solution pin <module> <ref> candidate > snapshot`); charms that already
+# match stable are skipped.
+# Promote a product module's charms from <track>/candidate to <track>/stable. Dry run by default.
+[group("promote")]
+promote-to-stable module ref snapshot dry_run="true":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  candidate=$(just solution pin "{{module}}" "{{ref}}" candidate)
+  if ! changes=$(diff -u <(jq -S . "{{snapshot}}") <(jq -S . <<< "$candidate")); then
+    echo "ERROR: candidate changed since the snapshot, so it may not be what was tested; nothing promoted. Start the gate again." >&2
+    echo "$changes" >&2
     exit 1
+  fi
+  # A charm with nothing in stable yet makes pin fail; then every charm is promoted.
+  stable=$(just solution pin "{{module}}" "{{ref}}" stable 2> /dev/null || echo '[]')
+  todo=$(jq -rn --argjson c "$candidate" --argjson s "$stable" '
+    $c[] | . as $x
+    | ($s | map(select(.charm == $x.charm)) | .[0]) as $y
+    | select($y == null or ($x | del(.channel)) != ($y | del(.channel)))
+    | "\(.charm) \(.track)"')
+  if [ -z "$todo" ]; then
+    echo "==> Nothing to promote: stable already matches candidate"
+    exit 0
+  fi
+  if [ "{{dry_run}}" = "false" ]; then
+    echo "==> Promoting to stable"
+  else
+    echo "==> Dry run: printing the promote commands only (pass dry_run=false to promote)"
   fi
   while read -r charm track; do
-    jq --arg charm "$charm" --arg track "$track" \
-       --arg channel "${track}/{{risk}}" --arg arch "{{arch}}" '
-      [.applications[]? | select(.charm == $charm) | {channel, revision, resources}] | unique
-      | if length == 0 then error("\($charm) was not deployed")
-        elif any(.channel != $channel) then error("\($charm) was not deployed from \($channel)")
-        elif length > 1 then error("the applications using \($charm) run different revisions")
-        else .[0] end
-      | {
-          charm: $charm,
-          track: $track,
-          channel: $channel,
-          revisions: [{revision: .revision, architecture: $arch}],
-          resources: (.resources | to_entries | map({name: .key, revision: .value}) | sort_by(.name))
-        }
-    ' "{{metrics_file}}"
-  done <<< "$charms_tracks" | jq -s .
-
-# Release recorded revisions and resources; SolQA tests amd64 only. Dry run by default.
-[group("promote")]
-release-pinned pin_file to_risk="stable" archs="amd64" dry_run="true":
-  #!/usr/bin/env bash
-  set -euo pipefail
-  if [ "{{dry_run}}" = "false" ]; then
-    echo "==> Releasing the pinned revisions to /{{to_risk}}"
-  else
-    echo "==> Dry run: printing the release commands only (pass dry_run=false to release)"
-  fi
-  releases=$(jq -r --arg risk "{{to_risk}}" '
-    .[] as $charm
-    | $charm.revisions[]
-    | [$charm.charm, (.revision | tostring), .architecture, "\($charm.track)/\($risk)"]
-      + [$charm.resources[] | "\(.name):\(.revision)"]
-    | @tsv
-  ' "{{pin_file}}")
-  if [ -z "$releases" ]; then
-    echo "ERROR: '{{pin_file}}' has no revisions; refusing to release nothing." >&2
-    exit 1
-  fi
-  skipped=0
-  while IFS=$'\t' read -r -a fields; do
-    charm=${fields[0]} revision=${fields[1]}
-    arch=${fields[2]} channel=${fields[3]}
-    if [[ " {{archs}} " != *" $arch "* ]]; then
-      echo "--> Skipping $charm revision $revision ($arch): not tested; release it by hand if intended"
-      skipped=$((skipped + 1))
-      continue
-    fi
-    args=(release "$charm" --revision "$revision" --channel "$channel")
-    for resource in "${fields[@]:4}"; do args+=(--resource "$resource"); done
+    args=(promote --name "$charm" --from-channel "${track}/candidate" --to-channel "${track}/stable" --yes)
     echo "--> charmcraft ${args[*]}"
     if [ "{{dry_run}}" = "false" ]; then charmcraft "${args[@]}"; fi
-  done <<< "$releases"
-  if [ "$skipped" -gt 0 ]; then echo "==> Skipped $skipped revision(s), listed above"; fi
+  done <<< "$todo"
+
+# version_overrides and test_parameters must be JSON strings: workflow_dispatch
+# inputs can't be objects. SolQA's COS recipes use only the ref and risk from
+# version_overrides.
+# Print the inputs for SolQA's Deploy Product workflow (deploy.yaml in canonical/terragrunt-deployment-pipelines).
+[group("solqa")]
+solqa-inputs product branch cluster test_ref test_repo="canonical/observability-stack":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  jq -nc --arg product "{{product}}" --arg branch "{{branch}}" --arg cluster "{{cluster}}" \
+    --arg ref "{{test_ref}}" --arg repo "{{test_repo}}" '{
+      type: "solution",
+      substrate: "maas_physical",
+      product: $product,
+      cluster: $cluster,
+      version_overrides: ({cos: {ref: $branch, risk: "candidate"}} | tojson),
+      test_parameters: ({repo: $repo, ref: $ref, args: [$product]} | tojson)
+    }'
+
+# expected_title and not_before check that the run is the one we started:
+# SolQA's executor takes the newest run, which may be another team's.
+# Exit 0 only if our tests ran and passed in a SolQA Deploy Product run.
+[group("solqa")]
+solqa-passed run_id expected_title="" not_before="":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  repo="canonical/terragrunt-deployment-pipelines"
+  url="https://github.com/${repo}/actions/runs/{{run_id}}"
+  run=$(gh api "repos/${repo}/actions/runs/{{run_id}}")
+  title=$(jq -r .display_title <<< "$run")
+  created=$(jq -r .created_at <<< "$run")
+  status=$(jq -r .status <<< "$run")
+  if [ -n "{{expected_title}}" ] && [ "$title" != "{{expected_title}}" ]; then
+    echo "ERROR: $url is '$title', not '{{expected_title}}': not the run we started" >&2
+    exit 1
+  fi
+  if [ -n "{{not_before}}" ] && [[ "$created" < "{{not_before}}" ]]; then
+    echo "ERROR: $url was created at $created, before {{not_before}}: not the run we started" >&2
+    exit 1
+  fi
+  if [ "$status" != "completed" ]; then
+    echo "ERROR: $url has not finished (status: $status)" >&2
+    exit 1
+  fi
+  # The step that runs our sqa_tests; it fails if any test fails.
+  step=$(gh api "repos/${repo}/actions/runs/{{run_id}}/jobs" --paginate \
+    --jq '.jobs[].steps[] | select(.name == "Run SQA tests") | .conclusion')
+  case "$step" in
+    success) echo "PASSED: our tests passed in $url" ;;
+    failure) echo "FAILED: our tests failed in $url" >&2; exit 1 ;;
+    *) echo "FAILED: our tests did not run in $url (step result: '${step:-missing}'); the lab or pipeline failed first. Start the gate again." >&2; exit 1 ;;
+  esac
