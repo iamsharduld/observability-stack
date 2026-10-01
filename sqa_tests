@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# SolQA entry point: run the solution tests against the deployed "cos" model.
-# Output: test_results.xml (JUnit), which SolQA keeps with the run.
-# Exit code: pytest's, so SolQA's "Run SQA tests" step fails if any test fails.
-# Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
-set -euo pipefail
+# DIAGNOSTIC (do not merge): why could an sshuttle tunnel reach the pods on
+# one SolQA cluster (dh1_j8_1) but not on another (dh1_j9_1)?
+# Prints "DIAG" sections and a summary; if a tunnel works, runs the solution
+# tests through it.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR" || exit 1
 rm -f test_results.xml
 
 MODEL="cos"
-# SolQA's runners have Python 3.10; the tests need 3.12.
 UV_FLAGS=(--frozen --isolated --python 3.12)
 
 solution="${1:-${PRODUCT:-}}"
@@ -28,48 +27,153 @@ if ! command -v uv &> /dev/null; then
     sudo snap install astral-uv --classic
 fi
 
-# TEMPORARY: SolQA's runner can't reach the pods directly
-# (https://github.com/canonical/terragrunt-deployment-pipelines/issues/235).
-# If so, route the pod addresses through one of the Kubernetes machines with
-# sshuttle, so the tests reach them unchanged. Remove once #235 is fixed.
+APPS="grafana:3000 prometheus:9090 loki:3100 alertmanager:9093"
+START=$(date +%s)
+section() { echo; echo "===== DIAG [+$(($(date +%s) - START))s]: $*"; }
 json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
-reachable() {
-    curl -sk -m 10 -o /dev/null "https://$1:3000/api/health" \
-        || curl -s -m 10 -o /dev/null "http://$1:3000/api/health"
+status_json() { juju status -m "$MODEL" --format json 2> /dev/null; }
+pod_ip() { status_json | json "print(next(iter(d['applications']['$1']['units'].values())).get('address', ''))"; }
+app_status() {
+    status_json | json "a = d['applications']['$1']; u = next(iter(a['units'].values())); print(a['application-status']['current'], u['workload-status']['current'], u['juju-status']['current'])"
 }
-grafana=$(juju status -m "$MODEL" --format json \
-    | json 'print(next(iter(d["applications"]["grafana"]["units"].values()))["address"])')
-if ! reachable "$grafana"; then
-    k8s_model=""
-    for model in $(juju models --format json | json 'print(" ".join(m["short-name"] for m in d["models"]))'); do
-        if juju status -m "$model" --format json \
-            | json 'sys.exit(0 if any(a.get("charm") == "k8s" for a in d.get("applications", {}).values()) else 1)'; then
-            k8s_model="$model"
-            break
-        fi
+# Prints "scheme:code/exit" for https and http. curl exit codes: 7 refused, 28 timeout, 35 TLS, 52 empty reply, 56 receive error.
+probe() {
+    local ip=$1 port=$2 out rc result=""
+    for scheme in https http; do
+        out=$(curl -sk -m 8 -o /dev/null -w "%{http_code}" "$scheme://$ip:$port/")
+        rc=$?
+        result+="$scheme:$out/$rc "
     done
-    if [ -z "$k8s_model" ]; then
-        echo "ERROR: can't reach the pods, and found no Kubernetes model to tunnel through" >&2
-        exit 1
+    echo "$result"
+}
+# True if either scheme got a real HTTP status back.
+answered() { [[ "$1" =~ (https|http):[1-9][0-9][0-9]/ ]]; }
+on_machine() { timeout 60 juju ssh -m "$k8s_model" "$1" -- "${@:2}" 2> /dev/null; }
+
+section "runner"
+id
+sudo -n true && echo "sudo: ok" || echo "sudo: NOT available"
+python3 --version
+juju version
+
+section "models and machines"
+k8s_model=""
+for m in $(juju models --format json | json 'print(" ".join(m["short-name"] for m in d["models"]))'); do
+    if juju status -m "$m" --format json 2> /dev/null \
+        | json 'sys.exit(0 if any(a.get("charm") == "k8s" for a in d.get("applications", {}).values()) else 1)'; then
+        k8s_model="$m"
     fi
-    machine=$(juju status -m "$k8s_model" --format json | json 'print(sorted(d["machines"])[0])')
-    pod_range="$(cut -d. -f1-2 <<< "$grafana").0.0/16"
-    echo "Pods aren't reachable; routing $pod_range through machine $machine of model $k8s_model"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshuttle > /dev/null
-    sshuttle --ssh-cmd "juju ssh -m $k8s_model" -r "$machine" "$pod_range" > sshuttle.log 2>&1 &
-    tunnel=$!
-    trap 'kill "$tunnel" 2> /dev/null || true' EXIT
-    for _ in $(seq 1 20); do
-        sleep 3
-        if reachable "$grafana"; then break; fi
-    done
-    if ! reachable "$grafana"; then
-        echo "ERROR: the pods are still unreachable through sshuttle:" >&2
-        cat sshuttle.log >&2
-        exit 1
-    fi
+done
+echo "kubernetes model: ${k8s_model:-NOT FOUND}"
+juju status -m "$k8s_model" --format json \
+    | json 'print("\n".join("machine %s: %s %s" % (k, v.get("dns-name"), v.get("ip-addresses")) for k, v in sorted(d["machines"].items())))'
+machines=$(juju status -m "$k8s_model" --format json | json 'print(" ".join(sorted(d["machines"])))')
+
+section "at start, before waiting (what the failed check saw)"
+grafana_start=$(pod_ip grafana)
+echo "grafana: $grafana_start, status: $(app_status grafana)"
+echo "probe grafana from runner: $(probe "$grafana_start" 3000)"
+status_json | json 'print("\n".join("%s: %s" % (k, a["application-status"]["current"]) for k, a in sorted(d["applications"].items())))'
+
+section "kubernetes view (from machine ${machines%% *})"
+first=${machines%% *}
+on_machine "$first" sudo k8s kubectl get nodes -o wide
+on_machine "$first" sudo k8s kubectl get pods -n "$MODEL" -o wide
+on_machine "$first" sudo k8s kubectl -n kube-system get configmap cilium-config -o yaml \
+    | grep -E '^\s*(routing-mode|tunnel-protocol|tunnel|enable-host-firewall|bpf-lb-sock|bpf-lb-sock-hostns-only|kube-proxy-replacement|enable-ipv4-masquerade|ipv4-native-routing-cidr|cluster-pool-ipv4-cidr):' || echo "(no cilium-config found)"
+
+section "wait until every app is active and idle (max 45 min)"
+QUERY='forEach(applications, app => app.status == "active" && forEach(app.units, unit => unit.workload-status == "active" && unit.agent-status == "idle"))'
+wait_start=$(date +%s)
+if timeout 2700 juju wait-for model "$MODEL" --timeout=45m --query="$QUERY" > /dev/null 2>&1; then
+    echo "healthy after $(($(date +%s) - wait_start))s"
+else
+    echo "NOT healthy after $(($(date +%s) - wait_start))s"
+    status_json | json 'print("\n".join("%s: %s" % (k, a["application-status"]["current"]) for k, a in sorted(d["applications"].items()) if a["application-status"]["current"] != "active"))'
 fi
 
-cd tests/solution
+section "after waiting"
+declare -A ip
+for entry in $APPS; do
+    app=${entry%%:*}
+    ip[$app]=$(pod_ip "$app")
+    echo "$app: ${ip[$app]}, status: $(app_status "$app")"
+done
+grafana_changed=no
+[ "${ip[grafana]}" != "$grafana_start" ] && grafana_changed=yes
+echo "grafana address changed during the wait: $grafana_changed ($grafana_start -> ${ip[grafana]})"
+on_machine "$first" sudo k8s kubectl get pods -n "$MODEL" -o wide
+pod_range="$(cut -d. -f1-2 <<< "${ip[grafana]}").0.0/16"
+echo "pod range: $pod_range"
+echo "probe grafana from runner: $(probe "${ip[grafana]}" 3000)"
+
+section "from each kubernetes machine, without a tunnel"
+declare -A machine_ok
+for m in $machines; do
+    echo "--- machine $m: $(on_machine "$m" hostname)"
+    on_machine "$m" ip route get "${ip[grafana]}"
+    ok=yes
+    for entry in $APPS; do
+        app=${entry%%:*} port=${entry##*:}
+        result=""
+        for scheme in https http; do
+            out=$(on_machine "$m" curl -sk -m 8 -o /dev/null -w "%{http_code}" "$scheme://${ip[$app]}:$port/")
+            rc=$?
+            result+="$scheme:${out:-none}/$rc "
+        done
+        echo "  $app (${ip[$app]}:$port): $result"
+        answered "$result" || ok=no
+    done
+    machine_ok[$m]=$ok
+done
+
+section "install sshuttle"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshuttle > /dev/null 2>&1
+sshuttle --version
+
+section "through an sshuttle tunnel via each machine"
+declare -A tunnel_ok
+for m in $machines; do
+    echo "--- tunnel via machine $m"
+    sshuttle -vv --ssh-cmd "juju ssh -m $k8s_model" -r "$m" "$pod_range" > "/tmp/sshuttle-$m.log" 2>&1 &
+    pid=$!
+    for _ in $(seq 1 15); do
+        sleep 3
+        grep -q "Connected to server" "/tmp/sshuttle-$m.log" && break
+    done
+    grep -q "Connected to server" "/tmp/sshuttle-$m.log" && echo "  connected" || echo "  NOT connected"
+    ok=yes
+    for entry in $APPS; do
+        app=${entry%%:*} port=${entry##*:}
+        result=$(probe "${ip[$app]}" "$port")
+        echo "  $app (${ip[$app]}:$port): $result"
+        answered "$result" || ok=no
+    done
+    tunnel_ok[$m]=$ok
+    echo "  sshuttle log (errors and connections):"
+    grep -iE "error|fail|refused|closed channel|Accept TCP|connect" "/tmp/sshuttle-$m.log" | tail -25 | sed 's/^/    /'
+    kill "$pid" 2> /dev/null
+    wait "$pid" 2> /dev/null
+    sleep 3
+done
+
+section "DIAG SUMMARY"
+echo "grafana address changed during the wait: $grafana_changed"
+for m in $machines; do
+    echo "machine $m: reaches all 4 pods directly: ${machine_ok[$m]}; through tunnel: ${tunnel_ok[$m]}"
+done
+best=""
+for m in $machines; do
+    if [ "${tunnel_ok[$m]}" = yes ]; then best=$m; break; fi
+done
+echo "DIAG RESULT: working tunnel machine: ${best:-none}"
+if [ -z "$best" ]; then exit 3; fi
+
+section "solution tests through the tunnel via machine $best"
+sshuttle --ssh-cmd "juju ssh -m $k8s_model" -r "$best" "$pod_range" > /tmp/sshuttle-tests.log 2>&1 &
+tunnel=$!
+trap 'kill "$tunnel" 2> /dev/null || true' EXIT
+sleep 15
+cd tests/solution || exit 1
 SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
     --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
