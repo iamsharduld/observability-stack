@@ -1,4 +1,37 @@
-#!/bin/bash
-set -eu
+#!/usr/bin/env bash
+# SolQA entry point: run the solution tests against the deployed "cos" model.
+# Output: test_results.xml (JUnit), which SolQA keeps with the run.
+# Exit code: pytest's, so SolQA's "Run SQA tests" step fails if any test fails.
+# Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
+set -euo pipefail
 
-./tests/sqa/model-active
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+rm -f test_results.xml
+
+MODEL="cos"
+# SolQA's runners have Python 3.10; the tests need 3.12.
+UV_FLAGS=(--frozen --isolated --python 3.12)
+
+solution="${1:-${PRODUCT:-}}"
+if [ $# -gt 0 ]; then shift; fi
+case "$solution" in
+    cos | cos-lite) ;;
+    *)
+        echo "ERROR: unknown solution '$solution'; pass cos or cos-lite, or set PRODUCT" >&2
+        exit 1
+        ;;
+esac
+
+if ! command -v uv &> /dev/null; then
+    echo "Installing astral-uv (snap, provides 'uv')..."
+    sudo snap install astral-uv --classic
+fi
+
+# TEMPORARY: SolQA's runner can't reach the applications over HTTP
+# (https://github.com/canonical/terragrunt-deployment-pipelines/issues/235), so
+# the tests send their requests from inside the Grafana unit with `juju exec`
+# (tests/solution/relay.py). Drop SOLUTION_HTTP_RELAY once #235 is fixed.
+cd tests/solution
+SOLUTION_MODEL="$MODEL" SOLUTION_HTTP_RELAY=grafana uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+    --junitxml="$SCRIPT_DIR/test_results.xml" "$@"

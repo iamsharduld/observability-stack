@@ -6,10 +6,11 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import jubilant
 import requests
+from relay import route
 
 SOLUTION_ROOT = Path(__file__).parent
 
@@ -25,7 +26,7 @@ def discover_solutions() -> frozenset[str]:
     )
 
 
-def terraform_output(terraform_dir: Path) -> Dict[str, Any]:
+def terraform_output(terraform_dir: Path) -> dict[str, Any]:
     """Return `terraform output -json` for an already-applied module."""
     result = subprocess.run(
         [TERRAFORM_BIN, f"-chdir={terraform_dir}", "output", "-json"],
@@ -65,10 +66,11 @@ def unit_url(juju: jubilant.Juju, app: str, port: int) -> str:
     """
     status = juju.status()
     address = next(iter(status.apps[app].units.values())).address
+    session = route(requests.Session(), juju)
     for scheme in ("https", "http"):
         url = f"{scheme}://{address}:{port}"
         try:
-            requests.get(url, timeout=30, verify=False)
+            session.get(url, timeout=30, verify=False)
         except requests.RequestException:
             continue
         return url
