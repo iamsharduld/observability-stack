@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# SolQA entry point: run the solution tests against the deployed "cos" model.
-# Output: test_results.xml (JUnit), which SolQA keeps with the run.
-# Exit code: pytest's, so SolQA's "Run SQA tests" step fails if any test fails.
-# Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
-set -euo pipefail
+# SPIKE (do not merge): can SolQA's runner reach the pods through an sshuttle
+# tunnel to a Kubernetes machine, instead of the juju exec relay?
+# Prints "SPIKE" sections, then runs the solution tests through the tunnel
+# with the relay switched off.
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR" || exit 1
 rm -f test_results.xml
 
 MODEL="cos"
-# SolQA's runners have Python 3.10; the tests need 3.12.
 UV_FLAGS=(--frozen --isolated --python 3.12)
 
 solution="${1:-${PRODUCT:-}}"
@@ -28,10 +27,93 @@ if ! command -v uv &> /dev/null; then
     sudo snap install astral-uv --classic
 fi
 
-# TEMPORARY: SolQA's runner can't reach the applications over HTTP
-# (https://github.com/canonical/terragrunt-deployment-pipelines/issues/235), so
-# the tests send their requests from inside the Grafana unit with `juju exec`
-# (tests/solution/relay.py). Drop SOLUTION_HTTP_RELAY once #235 is fixed.
-cd tests/solution
-SOLUTION_MODEL="$MODEL" SOLUTION_HTTP_RELAY=grafana uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+section() { echo; echo "===== SPIKE: $*"; }
+json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
+
+section "runner"
+id
+sudo -n true && echo "sudo: ok" || echo "sudo: NOT available"
+python3 --version
+juju version
+
+section "models"
+juju models --format json | json 'print("\n".join(m["name"] for m in d["models"]))'
+k8s_model=""
+for m in $(juju models --format json | json 'print(" ".join(m["short-name"] for m in d["models"]))'); do
+    if juju status -m "$m" --format json 2> /dev/null \
+        | json 'sys.exit(0 if any(a.get("charm") == "k8s" for a in d.get("applications", {}).values()) else 1)'; then
+        k8s_model="$m"
+        break
+    fi
+done
+echo "kubernetes model: ${k8s_model:-NOT FOUND}"
+juju status -m "$k8s_model" --format json \
+    | json 'print("\n".join("machine %s: %s %s" % (k, v.get("dns-name"), v.get("ip-addresses")) for k, v in d["machines"].items()))'
+k8s_machine=$(juju status -m "$k8s_model" --format json | json 'print(sorted(d["machines"])[0])')
+k8s_ip=$(juju status -m "$k8s_model" --format json | json "print(d['machines']['$k8s_machine']['dns-name'])")
+echo "tunnel machine: $k8s_machine ($k8s_ip)"
+
+section "pods"
+grafana_ip=$(juju status -m "$MODEL" --format json | json 'print(next(iter(d["applications"]["grafana"]["units"].values()))["address"])')
+pod_range="$(cut -d. -f1-2 <<< "$grafana_ip").0.0/16"
+echo "grafana pod: $grafana_ip, pod range: $pod_range"
+probe() {
+    for scheme in https http; do
+        code=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" "$scheme://$grafana_ip:3000/api/health")
+        if [ "$code" != "000" ]; then echo "$scheme $code"; return 0; fi
+    done
+    echo "no answer"
+    return 1
+}
+echo "direct, before any tunnel: $(probe)"
+
+section "network"
+ip route
+sudo nft list tables 2>&1 | head -20
+
+section "install sshuttle"
+# The log file is written as this user on purpose.
+# shellcheck disable=SC2024
+if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshuttle > /tmp/apt-sshuttle.log 2>&1; then
+    sshuttle --version
+else
+    echo "apt-get install sshuttle failed:"
+    tail -5 /tmp/apt-sshuttle.log
+fi
+
+tunnel() { # name, ssh command, remote
+    echo "--- trying $1: sshuttle --ssh-cmd \"$2\" -r $3 $pod_range"
+    sshuttle -v --ssh-cmd "$2" -r "$3" "$pod_range" > "/tmp/sshuttle-$1.log" 2>&1 &
+    local pid=$! result="no answer"
+    for _ in $(seq 1 20); do
+        sleep 3
+        if result=$(probe); then break; fi
+    done
+    echo "$1: probe says $result"
+    tail -15 "/tmp/sshuttle-$1.log"
+    # Only count it if sshuttle is still running and says it connected.
+    if [ "$result" != "no answer" ] && kill -0 "$pid" 2> /dev/null \
+        && grep -q "Connected" "/tmp/sshuttle-$1.log"; then
+        echo "$pid" > /tmp/sshuttle.pid
+        return 0
+    fi
+    kill "$pid" 2> /dev/null
+    wait "$pid" 2> /dev/null
+    return 1
+}
+
+section "tunnel"
+ok=""
+if [ -n "$k8s_model" ]; then
+    tunnel juju-ssh "juju ssh -m $k8s_model" "$k8s_machine" && ok="juju-ssh"
+    [ -z "$ok" ] && tunnel juju-ssh-proxy "juju ssh --proxy -m $k8s_model" "$k8s_machine" && ok="juju-ssh-proxy"
+fi
+[ -z "$ok" ] && tunnel plain-ssh "ssh -o StrictHostKeyChecking=no" "ubuntu@$k8s_ip" && ok="plain-ssh"
+echo "SPIKE RESULT: tunnel=${ok:-none}"
+if [ -z "$ok" ]; then exit 3; fi
+
+section "solution tests through the tunnel, relay off"
+trap 'kill "$(cat /tmp/sshuttle.pid)" 2> /dev/null || true' EXIT
+cd tests/solution || exit 1
+SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
     --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
