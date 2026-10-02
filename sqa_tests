@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# SolQA entry point: run the solution tests against the deployed "cos" model.
-# Output: test_results.xml (JUnit), which SolQA keeps with the run.
-# Exit code: pytest's, so SolQA's "Run SQA tests" step fails if any test fails.
-# Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
+# DIAGNOSTIC (do not merge): does no_proxy, or skipping SolQA's proxy entirely,
+# let the runner reach COS? Probes a pod, Traefik's load balancer address,
+# Traefik's node port and SSH four ways:
+#   A. as the runner is set up now;
+#   B. with no_proxy / NO_PROXY set;
+#   C. through the egress proxy, asked explicitly (shows the proxy's answer);
+#   D. with no proxy at all (aproxy_nosni's redirect removed for a moment).
+# Then runs the tests with no_proxy set and no tunnel, stopping at the first
+# failure. Output: test_results.xml. Exit code: pytest's.
+# shellcheck disable=SC2030,SC2031  # steps B and C change proxy variables in subshells on purpose
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +18,7 @@ rm -f test_results.xml
 MODEL="cos"
 # SolQA's runners have Python 3.10; the tests need 3.12.
 UV_FLAGS=(--frozen --isolated --python 3.12)
+EGRESS=http://egress.ps7.internal:3128
 
 solution="${1:-${PRODUCT:-}}"
 if [ $# -gt 0 ]; then shift; fi
@@ -28,59 +35,142 @@ if ! command -v uv &> /dev/null; then
     sudo snap install astral-uv --classic
 fi
 
-# TEMPORARY: SolQA's runner can't reach the pods directly
-# (https://github.com/canonical/terragrunt-deployment-pipelines/issues/235).
-# If so, route the pod addresses through one of the Kubernetes machines with
-# sshuttle, so the tests reach them unchanged. Remove once #235 is fixed.
-json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
-reachable() {
-    curl -sk -m 10 -o /dev/null "https://$1:3000/api/health" \
-        || curl -s -m 10 -o /dev/null "http://$1:3000/api/health"
-}
-grafana() {
-    juju status -m "$MODEL" --format json \
-        | json 'print(next(iter(d["applications"]["grafana"]["units"].values()))["address"])'
-}
-# Right after SolQA's deploy, pods are still being replaced and their
-# addresses change, so first wait until everything is active and idle, the
-# same way the tests do (`juju wait-for` missed a settled model on SolQA).
+hr() { printf '\n================ [%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+WORK=$(mktemp -d)
+
+hr "0. wait until COS is active and idle"
 if ! (cd tests/solution && MODEL="$MODEL" uv run "${UV_FLAGS[@]}" python -c \
     'import os, jubilant; from helpers import wait_for_active_idle; wait_for_active_idle(jubilant.Juju(model=os.environ["MODEL"]))'); then
-    echo "ERROR: $MODEL didn't become active and idle" >&2
-    juju status -m "$MODEL" >&2
-    exit 1
-fi
-if ! reachable "$(grafana)"; then
-    k8s_model=""
-    for model in $(juju models --format json | json 'print(" ".join(m["short-name"] for m in d["models"]))'); do
-        if juju status -m "$model" --format json \
-            | json 'sys.exit(0 if any(a.get("charm") == "k8s" for a in d.get("applications", {}).values()) else 1)'; then
-            k8s_model="$model"
-            break
-        fi
-    done
-    if [ -z "$k8s_model" ]; then
-        echo "ERROR: can't reach the pods, and found no Kubernetes model to tunnel through" >&2
-        exit 1
-    fi
-    machine=$(juju status -m "$k8s_model" --format json | json 'print(sorted(d["machines"])[0])')
-    pod_range="$(cut -d. -f1-2 <<< "$(grafana)").0.0/16"
-    echo "Pods aren't reachable; routing $pod_range through machine $machine of model $k8s_model"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshuttle > /dev/null
-    sshuttle --ssh-cmd "juju ssh -m $k8s_model" -r "$machine" "$pod_range" > sshuttle.log 2>&1 &
-    tunnel=$!
-    trap 'kill "$tunnel" 2> /dev/null || true' EXIT
-    for _ in $(seq 1 20); do
-        sleep 3
-        if reachable "$(grafana)"; then break; fi
-    done
-    if ! reachable "$(grafana)"; then
-        echo "ERROR: the pods are still unreachable through sshuttle:" >&2
-        cat sshuttle.log >&2
-        exit 1
-    fi
+    echo "not settled, carrying on"
 fi
 
+hr "1. targets"
+K8S_MODEL=""
+for m in $(juju models --format json | jq -r '.models[]."short-name"'); do
+    if juju status -m "$m" --format json | jq -e '[.applications[]?.charm] | index("k8s")' > /dev/null; then
+        K8S_MODEL=$m
+        break
+    fi
+done
+GRAFANA=$(juju status -m "$MODEL" grafana --format json | jq -r '.applications.grafana.units[].address' | head -1)
+LB=$(juju status -m "$MODEL" traefik --format json | jq -r '.applications.traefik.units[]."workload-status".message' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1 || true)
+NODES=()
+NODEPORT=""
+if [ -n "$K8S_MODEL" ]; then
+    mapfile -t NODES < <(juju status -m "$K8S_MODEL" --format json | jq -r '.machines | to_entries | sort_by(.key | tonumber) | .[].value."dns-name"')
+    NODEPORT=$(timeout 300 juju exec -m "$K8S_MODEL" --unit k8s/leader -- \
+        "/snap/bin/k8s kubectl get svc -n $MODEL traefik-lb -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}'" 2> /dev/null || true)
+fi
+NODE=${NODES[0]:-}
+echo "k8s model:      ${K8S_MODEL:-none}"
+echo "grafana pod:    ${GRAFANA:-none}"
+echo "traefik LB:     ${LB:-none}"
+echo "k8s machines:   ${NODES[*]:-none}"
+echo "node port (80): ${NODEPORT:-none}"
+
+TARGETS=("pod|https://$GRAFANA:3000/api/health")
+if [ -n "$LB" ]; then TARGETS+=("lb|http://$LB/cos-grafana/api/health"); fi
+if [ -n "$NODE" ] && [ -n "$NODEPORT" ]; then TARGETS+=("nodeport|http://$NODE:$NODEPORT/cos-grafana/api/health"); fi
+NOPROXY="localhost,127.0.0.1,::1,$GRAFANA${LB:+,$LB}${NODE:+,$NODE},10.1.0.0/16,10.241.0.0/16"
+
+# curl and the SSH banner, one line per target.
+probe_curl() { # mode, then extra curl args
+    local mode=$1 t label url
+    shift
+    for t in "${TARGETS[@]}"; do
+        label=${t%%|*}
+        url=${t#*|}
+        printf 'PROBE %-12s %-9s curl     %-46s -> %s\n' "$mode" "$label" "$url" \
+            "$({ curl "$@" -k -sS -o /dev/null -m 10 -w 'code=%{http_code} connect=%{time_connect}s total=%{time_total}s' "$url" 2>&1 || true; } | tr '\n' ' ')"
+    done
+    if [ -n "$NODE" ]; then
+        printf 'PROBE %-12s %-9s bash     %-46s -> %s\n' "$mode" "ssh" "$NODE:22" \
+            "$({ timeout 10 bash -c "exec 3<>/dev/tcp/$NODE/22 && head -c 40 <&3" 2>&1 || echo "no banner"; } | tr -d '\r\n')"
+    fi
+}
+
+# Python requests, the library the tests use (it reads http_proxy and no_proxy).
+probe_requests() { # mode
+    (cd tests/solution && MODE="$1" uv run "${UV_FLAGS[@]}" python - "${TARGETS[@]}" << 'EOF'
+import os, sys, time, warnings
+
+import requests
+
+warnings.filterwarnings("ignore")
+for target in sys.argv[1:]:
+    label, url = target.split("|", 1)
+    start = time.monotonic()
+    try:
+        result = f"code={requests.get(url, timeout=10, verify=False).status_code}"
+    except Exception as e:
+        result = f"{type(e).__name__}: {str(e)[:120]}"
+    print(f"PROBE {os.environ['MODE']:<12} {label:<9} requests {url:<46} -> {result} ({time.monotonic() - start:.1f}s)", flush=True)
+EOF
+    ) || true
+}
+
+hr "2. the runner's proxy settings and redirect rules"
+env | grep -i '_proxy=' || echo "no proxy variables set"
+sudo nft list tables 2>&1 || true
+echo "--- nft list table ip aproxy_nosni"
+sudo nft list table ip aproxy_nosni 2>&1 || true
+
+hr "3. A: as the runner is set up now"
+probe_curl "A-as-now"
+probe_requests "A-as-now"
+
+hr "4. B: with no_proxy and NO_PROXY set"
+echo "no_proxy=$NOPROXY"
+(
+    export no_proxy="$NOPROXY" NO_PROXY="$NOPROXY"
+    probe_curl "B-no_proxy"
+    probe_requests "B-no_proxy"
+)
+
+hr "5. C: through the egress proxy, asked explicitly"
+for t in "${TARGETS[@]}"; do
+    label=${t%%|*}
+    url=${t#*|}
+    for how in forward connect; do
+        flags=(-x "$EGRESS")
+        if [ "$how" = connect ]; then flags+=(-p); fi
+        echo "--- $label ($how): $url"
+        { curl -k -sSv -o /dev/null -m 75 "${flags[@]}" "$url" 2>&1 || true; } \
+            | grep -E '^< HTTP|X-Squid-Error|CONNECT tunnel|CONNECT phase|Proxy CONNECT|^curl: \(' | head -6 || true
+    done
+done
+if [ -n "$NODE" ]; then
+    echo "--- ssh (connect): $NODE:22"
+    { timeout 20 curl -sSv -m 15 -p -x "$EGRESS" "telnet://$NODE:22" < /dev/null 2>&1 || true; } \
+        | grep -E '^< HTTP|X-Squid-Error|CONNECT tunnel|CONNECT phase|SSH-|^curl: \(' | head -6 || true
+fi
+(
+    export http_proxy="$EGRESS" https_proxy="$EGRESS" HTTP_PROXY="$EGRESS" HTTPS_PROXY="$EGRESS"
+    unset no_proxy NO_PROXY
+    probe_requests "C-proxy"
+)
+
+hr "6. D: no proxy at all (aproxy_nosni's redirect removed for a moment)"
+if saved=$(sudo nft list table ip aproxy_nosni 2> /dev/null); then
+    printf '%s\n' "$saved" > "$WORK/aproxy_nosni.nft"
+    restore_redirect() {
+        if ! sudo nft list table ip aproxy_nosni > /dev/null 2>&1; then
+            sudo nft -f "$WORK/aproxy_nosni.nft" && echo "aproxy_nosni's redirect restored"
+        fi
+    }
+    trap restore_redirect EXIT
+    sudo nft delete table ip aproxy_nosni
+    probe_curl "D-no-proxy" --noproxy '*'
+    restore_redirect
+    trap - EXIT
+    sudo nft list tables 2>&1 || true
+    juju status -m "$MODEL" --format short > /dev/null 2>&1 && echo "juju still works after the restore"
+else
+    echo "no aproxy_nosni table on this runner; step skipped"
+fi
+
+hr "7. the tests with no_proxy set and no tunnel, stopping at the first failure"
 cd tests/solution
-SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
+export no_proxy="$NOPROXY" NO_PROXY="$NOPROXY"
+SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra -x "$solution" \
     --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
