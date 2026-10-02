@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# SolQA entry point: run the solution tests against the deployed "cos" model.
-# Output: test_results.xml (JUnit), which SolQA keeps with the run.
-# Exit code: pytest's, so SolQA's "Run SQA tests" step fails if any test fails.
-# Usage: ./sqa_tests [cos|cos-lite] [pytest args]; defaults to $PRODUCT.
+# VERIFY (do not merge): with load-balancer-l2-mode on, can SolQA's runner reach
+# Traefik's load balancer address? For canonical/terragrunt-deployment-pipelines#235.
+# Shows the load balancer settings, then calls Traefik's address from inside the
+# lab (the Juju controller machine, no proxy) and from the runner (through the
+# egress proxy). Exit code: 0 if the runner gets 200, else 1.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,74 +14,58 @@ MODEL="cos"
 # SolQA's runners have Python 3.10; the tests need 3.12.
 UV_FLAGS=(--frozen --isolated --python 3.12)
 
-solution="${1:-${PRODUCT:-}}"
-if [ $# -gt 0 ]; then shift; fi
-case "$solution" in
-    cos | cos-lite) ;;
-    *)
-        echo "ERROR: unknown solution '$solution'; pass cos or cos-lite, or set PRODUCT" >&2
-        exit 1
-        ;;
-esac
-
 if ! command -v uv &> /dev/null; then
     echo "Installing astral-uv (snap, provides 'uv')..."
     sudo snap install astral-uv --classic
 fi
 
-# TEMPORARY: SolQA's runner can't reach the pods directly
-# (https://github.com/canonical/terragrunt-deployment-pipelines/issues/235).
-# If so, route the pod addresses through one of the Kubernetes machines with
-# sshuttle, so the tests reach them unchanged. Remove once #235 is fixed.
-json() { python3 -c "import json, sys; d = json.load(sys.stdin); $1"; }
-reachable() {
-    curl -sk -m 10 -o /dev/null "https://$1:3000/api/health" \
-        || curl -s -m 10 -o /dev/null "http://$1:3000/api/health"
-}
-grafana() {
-    juju status -m "$MODEL" --format json \
-        | json 'print(next(iter(d["applications"]["grafana"]["units"].values()))["address"])'
-}
-# Right after SolQA's deploy, pods are still being replaced and their
-# addresses change, so first wait until everything is active and idle, the
-# same way the tests do (`juju wait-for` missed a settled model on SolQA).
+hr() { printf '\n================ [%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+
+hr "0. wait until COS is active and idle"
 if ! (cd tests/solution && MODEL="$MODEL" uv run "${UV_FLAGS[@]}" python -c \
     'import os, jubilant; from helpers import wait_for_active_idle; wait_for_active_idle(jubilant.Juju(model=os.environ["MODEL"]))'); then
-    echo "ERROR: $MODEL didn't become active and idle" >&2
-    juju status -m "$MODEL" >&2
-    exit 1
-fi
-if ! reachable "$(grafana)"; then
-    k8s_model=""
-    for model in $(juju models --format json | json 'print(" ".join(m["short-name"] for m in d["models"]))'); do
-        if juju status -m "$model" --format json \
-            | json 'sys.exit(0 if any(a.get("charm") == "k8s" for a in d.get("applications", {}).values()) else 1)'; then
-            k8s_model="$model"
-            break
-        fi
-    done
-    if [ -z "$k8s_model" ]; then
-        echo "ERROR: can't reach the pods, and found no Kubernetes model to tunnel through" >&2
-        exit 1
-    fi
-    machine=$(juju status -m "$k8s_model" --format json | json 'print(sorted(d["machines"])[0])')
-    pod_range="$(cut -d. -f1-2 <<< "$(grafana)").0.0/16"
-    echo "Pods aren't reachable; routing $pod_range through machine $machine of model $k8s_model"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshuttle > /dev/null
-    sshuttle --ssh-cmd "juju ssh -m $k8s_model" -r "$machine" "$pod_range" > sshuttle.log 2>&1 &
-    tunnel=$!
-    trap 'kill "$tunnel" 2> /dev/null || true' EXIT
-    for _ in $(seq 1 20); do
-        sleep 3
-        if reachable "$(grafana)"; then break; fi
-    done
-    if ! reachable "$(grafana)"; then
-        echo "ERROR: the pods are still unreachable through sshuttle:" >&2
-        cat sshuttle.log >&2
-        exit 1
-    fi
+    echo "not settled, carrying on"
 fi
 
-cd tests/solution
-SOLUTION_MODEL="$MODEL" uv run "${UV_FLAGS[@]}" pytest -vv -ra "$solution" \
-    --junitxml="$SCRIPT_DIR/test_results.xml" "$@"
+hr "1. load balancer settings"
+K8S_MODEL=""
+for m in $(juju models --format json | jq -r '.models[]."short-name"'); do
+    if juju status -m "$m" --format json | jq -e '[.applications[]?.charm] | index("k8s")' > /dev/null; then
+        K8S_MODEL=$m
+        break
+    fi
+done
+echo "k8s model: ${K8S_MODEL:-none}"
+if [ -n "$K8S_MODEL" ]; then
+    timeout 300 juju exec -m "$K8S_MODEL" --unit k8s/leader -- \
+        "/snap/bin/k8s get load-balancer; /snap/bin/k8s kubectl get svc -n $MODEL traefik-lb -o wide" 2>&1 || true
+fi
+LB=$(juju status -m "$MODEL" traefik --format json | jq -r '.applications.traefik.units[]."workload-status".message' | grep -oE '[0-9]+(\.[0-9]+){3}' | head -1 || true)
+echo "traefik's load balancer address: ${LB:-none}"
+if [ -z "$LB" ]; then
+    echo "ERROR: no load balancer address in Traefik's status" >&2
+    exit 1
+fi
+URL="http://$LB/cos-grafana/api/health"
+
+hr "2. from inside the lab: the Juju controller machine, no proxy"
+timeout 120 juju exec -m controller --machine 0 -- \
+    "curl --noproxy '*' -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' $URL" 2>&1 || true
+echo
+
+hr "3. from the runner, through the egress proxy (up to 2 minutes)"
+code=000
+for _ in $(seq 1 12); do
+    code=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "$URL" 2> /dev/null || true)
+    echo "$(date -u +%H:%M:%SZ) GET $URL -> ${code:-000}"
+    if [ "$code" = 200 ]; then break; fi
+    sleep 10
+done
+
+hr "result"
+if [ "$code" = 200 ]; then
+    echo "PASSED: the runner reached Traefik's load balancer address"
+else
+    echo "FAILED: the runner didn't get 200 from Traefik's load balancer address"
+    exit 1
+fi
