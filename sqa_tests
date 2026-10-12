@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# VERIFY (do not merge): with load-balancer-l2-mode on, can SolQA's runner reach
-# Traefik's load balancer address? For canonical/terragrunt-deployment-pipelines#235.
-# Shows the load balancer settings, then calls Traefik's address from inside the
-# lab (the Juju controller machine, no proxy) and from the runner (through the
-# egress proxy). Exit code: 0 if the runner gets 200, else 1.
+# DIAGNOSTIC (do not merge): after terragrunt-deployment-pipelines#274, the
+# runner gets HTTP 503 from Traefik's load balancer address. Is that Traefik or
+# the egress proxy? Calls the address from the Juju controller machine and a
+# Kubernetes machine (no proxy), then from the runner, printing the response
+# headers (squid adds X-Squid-Error). Exit code: 0 if the runner gets 200, else 1.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,10 +48,15 @@ if [ -z "$LB" ]; then
 fi
 URL="http://$LB/cos-grafana/api/health"
 
-hr "2. from inside the lab: the Juju controller machine, no proxy"
+hr "2. from inside the lab, no proxy: the Juju controller machine, then a Kubernetes machine"
 timeout 120 juju exec -m controller --machine 0 -- \
-    "curl --noproxy '*' -sS -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' $URL" 2>&1 || true
+    "curl --noproxy '*' -sS -D - -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' $URL" 2>&1 || true
 echo
+if [ -n "$K8S_MODEL" ]; then
+    timeout 120 juju exec -m "$K8S_MODEL" --machine 0 -- \
+        "curl --noproxy '*' -sS -D - -o /dev/null -m 10 -w 'code=%{http_code} total=%{time_total}s' $URL" 2>&1 || true
+    echo
+fi
 
 hr "3. from the runner, through the egress proxy (up to 2 minutes)"
 code=000
@@ -61,6 +66,13 @@ for _ in $(seq 1 12); do
     if [ "$code" = 200 ]; then break; fi
     sleep 10
 done
+
+hr "4. from the runner: response headers, and how it routes to the address"
+curl -sS -D - -o /dev/null -m 10 "$URL" 2>&1 || true
+echo "--- asking the egress proxy directly (squid adds X-Squid-Error when it fails)"
+curl -sS -D - -o /dev/null -m 70 -x http://egress.ps7.internal:3128 "$URL" 2>&1 || true
+ip route get "$LB" || true
+env | grep -i '_proxy=' | sed -E 's#://[^@/]*@#://***@#' || true
 
 hr "result"
 if [ "$code" = 200 ]; then
